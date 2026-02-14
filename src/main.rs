@@ -116,6 +116,7 @@ async fn xmpp_task(
             Event::Stanza(stanza) => match Message::try_from(stanza) {
                 Ok(message) => {
                     if let Some((_, body)) = message.get_best_body(vec![""]) {
+                        log::debug!("Raw XMPP message body: {}", body);
                         match serde_json::from_str::<data::ESmartMessage>(body) {
                             Ok(msg) => {
                                 messages_recv.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -140,10 +141,20 @@ async fn xmpp_task(
                 client.send_stanza(presence.into()).await?;
 
                 let muc = Muc::new();
-                let room_jid = args
+                let room_jid = match args
                     .xmpp_room
                     .with_resource_str(&args.xmpp_nickname)
-                    .unwrap();
+                {
+                    Ok(jid) => jid,
+                    Err(e) => {
+                        log::error!(
+                            "Failed to construct room JID with nickname '{}': {:?}",
+                            args.xmpp_nickname,
+                            e
+                        );
+                        continue;
+                    }
+                };
                 let mut presence = Presence::new(PresenceType::None).with_to(room_jid);
                 presence.add_payload(muc);
                 presence.set_status("en", "here");
