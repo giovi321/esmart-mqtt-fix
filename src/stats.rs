@@ -52,21 +52,21 @@ impl Stat {
         &self.property
     }
 
-    pub fn device_class_str(&self) -> &str {
+    pub fn device_class_str(&self) -> Option<&str> {
         match self.device_class {
-            DeviceClass::None => "",
-            DeviceClass::Water => "water",
-            DeviceClass::Power => "power",
-            DeviceClass::Temperature => "temperature",
+            DeviceClass::None => None,
+            DeviceClass::Water => Some("water"),
+            DeviceClass::Power => Some("power"),
+            DeviceClass::Temperature => Some("temperature"),
         }
     }
 
-    pub fn unit_str(&self) -> &str {
+    pub fn unit_str(&self) -> Option<&str> {
         match self.unit {
-            Unit::None => "",
-            Unit::C => "C",
-            Unit::Lmin => "L/min",
-            Unit::W => "W",
+            Unit::None => None,
+            Unit::C => Some("°C"),
+            Unit::Lmin => Some("L/min"),
+            Unit::W => Some("W"),
         }
     }
 }

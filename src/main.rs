@@ -54,20 +54,24 @@ async fn send_mqtt_discovery(
     let state_topic = format!("esmart/{id}/state");
     let name = format!("{} ({})", stat.name(), stat.property());
 
-    let json = json!({
+    let mut map = serde_json::Map::new();
+    map.insert("name".into(), json!(name));
+    map.insert("state_topic".into(), json!(state_topic));
+    map.insert("icon".into(), json!(stat.icon()));
+    map.insert("value_template".into(), json!(format!("{{{{ value_json.{} }}}}", stat.property())));
+    map.insert("unique_id".into(), json!(format!("esmart_{id}")));
+    map.insert("device".into(), json!({
         "name": name,
-        "state_topic": state_topic,
-        "device_class": stat.device_class_str(),
-        "icon": stat.icon(),
-        "value_template": format!("{{{{ value_json.{} }}}}", stat.property()),
-        "unit_of_measurement": stat.unit_str(),
-        "unique_id": format!("esmart_{id}"),
-        "device": {
-            "name": name,
-            "model": "eSmarter Client",
-            "identifiers": [format!("esmart_{id}")]
-        }
-    });
+        "model": "eSmarter Client",
+        "identifiers": [format!("esmart_{id}")]
+    }));
+    if let Some(dc) = stat.device_class_str() {
+        map.insert("device_class".into(), json!(dc));
+    }
+    if let Some(unit) = stat.unit_str() {
+        map.insert("unit_of_measurement".into(), json!(unit));
+    }
+    let json = serde_json::Value::Object(map);
 
     log::debug!("Sending discovery message to '{}': {}", config_topic, json);
     client
