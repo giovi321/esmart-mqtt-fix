@@ -3,10 +3,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 mod date_format {
-    use chrono::{DateTime, Utc};
+    use chrono::{DateTime, NaiveDateTime, Utc};
     use serde::{self, Deserialize, Deserializer, Serializer};
 
     const FORMAT: &str = "%Y-%m-%d %H:%M:%S%z";
+    const FORMAT_ISO: &str = "%Y-%m-%dT%H:%M:%S%z";
+    const FORMAT_ISO_NAIVE: &str = "%Y-%m-%dT%H:%M:%S";
 
     #[allow(dead_code)]
     pub fn serialize<S>(date: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
@@ -22,7 +24,28 @@ mod date_format {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        Ok(DateTime::parse_from_str(&s, FORMAT).unwrap().into())
+
+        if let Ok(dt) = DateTime::parse_from_str(&s, FORMAT) {
+            return Ok(dt.into());
+        }
+
+        let with_tz = format!("{}+0000", s);
+        if let Ok(dt) = DateTime::parse_from_str(&with_tz, FORMAT) {
+            return Ok(dt.into());
+        }
+
+        if let Ok(dt) = DateTime::parse_from_str(&s, FORMAT_ISO) {
+            return Ok(dt.into());
+        }
+
+        if let Ok(dt) = NaiveDateTime::parse_from_str(&s, FORMAT_ISO_NAIVE) {
+            return Ok(dt.and_utc());
+        }
+
+        Err(serde::de::Error::custom(format!(
+            "failed to parse timestamp: '{}'",
+            s
+        )))
     }
 }
 
