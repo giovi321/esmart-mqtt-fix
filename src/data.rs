@@ -125,11 +125,28 @@ pub struct RoomData {
     temperature: f32,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ActuatorData {
+    position: f32,
+    orientation: f32,
+    power: f32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct FanData {
+    speed: String,
+    power: f32,
+    mode: String,
+}
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(untagged)]
 pub enum Node {
     Room { id: u16, data: RoomData },
     Valve { id: u16, data: ValveData },
+    Actuator { id: u16, data: ActuatorData },
+    Fan { id: u16, data: FanData },
+    Unknown(serde_json::Value),
 }
 
 #[derive(Deserialize, Debug)]
@@ -296,6 +313,53 @@ impl IterStats<std::vec::IntoIter<(String, Stat, f32)>> for &Node {
                 ),
             ]
             .into_iter(),
+            Node::Actuator {
+                id,
+                data: ActuatorData { position, power, .. },
+            } => vec![
+                (
+                    format!("actuator_position_{id}"),
+                    Stat::new(
+                        &format!("Actuator {id} Position"),
+                        Unit::None,
+                        DeviceClass::None,
+                        "mdi:valve",
+                        "position",
+                    ),
+                    *position,
+                ),
+                (
+                    format!("actuator_power_{id}"),
+                    Stat::new(
+                        &format!("Actuator {id} Power"),
+                        Unit::None,
+                        DeviceClass::None,
+                        "mdi:valve",
+                        "power",
+                    ),
+                    *power,
+                ),
+            ]
+            .into_iter(),
+            Node::Fan {
+                id,
+                data: FanData { power, .. },
+            } => vec![(
+                format!("fan_power_{id}"),
+                Stat::new(
+                    &format!("Fan {id} Power"),
+                    Unit::None,
+                    DeviceClass::None,
+                    "mdi:fan",
+                    "power",
+                ),
+                *power,
+            )]
+            .into_iter(),
+            Node::Unknown(v) => {
+                log::debug!("Unknown node type: {:?}", v);
+                vec![].into_iter()
+            }
         }
     }
 }
