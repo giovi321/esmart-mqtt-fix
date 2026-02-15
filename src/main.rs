@@ -29,6 +29,75 @@ mod stats;
 
 type ChannelMessage = (String, Stat, StatValue);
 
+/// Compute the MQTT device block for a given entity_id so that related entities
+/// are grouped under the same Home Assistant device.
+fn device_for_entity(id: &str) -> serde_json::Value {
+    // Actuator entities: actuator_position_N, actuator_orientation_N, actuator_power_N,
+    // actuator_N_travel_open, actuator_N_travel_close
+    if let Some(rest) = id.strip_prefix("actuator_") {
+        // Extract node id: strip known prefixes/suffixes
+        let node_id = rest.strip_prefix("position_")
+            .or_else(|| rest.strip_prefix("orientation_"))
+            .or_else(|| rest.strip_prefix("power_"))
+            .or_else(|| rest.strip_suffix("_travel_open"))
+            .or_else(|| rest.strip_suffix("_travel_close"))
+            .unwrap_or(rest);
+        return json!({
+            "name": format!("eSmart Actuator {node_id}"),
+            "model": "eSmarter Client",
+            "manufacturer": "eSmart",
+            "identifiers": [format!("esmart_actuator_{node_id}")]
+        });
+    }
+    // Room entities: room_temperature_N, room_setpoint_N, room_heating_on_N, room_heating_power_N
+    if let Some(rest) = id.strip_prefix("room_") {
+        let node_id = rest.strip_prefix("temperature_")
+            .or_else(|| rest.strip_prefix("setpoint_"))
+            .or_else(|| rest.strip_prefix("heating_on_"))
+            .or_else(|| rest.strip_prefix("heating_power_"))
+            .unwrap_or(rest);
+        return json!({
+            "name": format!("eSmart Room {node_id}"),
+            "model": "eSmarter Client",
+            "manufacturer": "eSmart",
+            "identifiers": [format!("esmart_room_{node_id}")]
+        });
+    }
+    // Fan entities: fan_speed_N, fan_mode_N, fan_power_N
+    if let Some(rest) = id.strip_prefix("fan_") {
+        let node_id = rest.strip_prefix("speed_")
+            .or_else(|| rest.strip_prefix("mode_"))
+            .or_else(|| rest.strip_prefix("power_"))
+            .unwrap_or(rest);
+        return json!({
+            "name": format!("eSmart Fan {node_id}"),
+            "model": "eSmarter Client",
+            "manufacturer": "eSmart",
+            "identifiers": [format!("esmart_fan_{node_id}")]
+        });
+    }
+    // Valve entities: valve_power_N, valve_on_N
+    if let Some(rest) = id.strip_prefix("valve_") {
+        let node_id = rest.strip_prefix("power_")
+            .or_else(|| rest.strip_prefix("on_"))
+            .unwrap_or(rest);
+        return json!({
+            "name": format!("eSmart Valve {node_id}"),
+            "model": "eSmarter Client",
+            "manufacturer": "eSmart",
+            "identifiers": [format!("esmart_valve_{node_id}")]
+        });
+    }
+    // Everything else (meters, holiday_mode, freecooling, modbus errors, valves_state)
+    // goes into a single "eSmart System" device.
+    json!({
+        "name": "eSmart System",
+        "model": "eSmarter Client",
+        "manufacturer": "eSmart",
+        "identifiers": ["esmart_system"]
+    })
+}
+
 fn process_meter(queue: &mut Sender<ChannelMessage>, meter: &Meter) {
     for (id, stat, value) in meter.into_stats_iter() {
         match queue.send((id, stat, value)) {
@@ -64,11 +133,7 @@ async fn send_mqtt_discovery(
     map.insert("icon".into(), json!(stat.icon()));
     map.insert("value_template".into(), json!(format!("{{{{ value_json.{} }}}}", stat.property())));
     map.insert("unique_id".into(), json!(format!("esmart_{id}")));
-    map.insert("device".into(), json!({
-        "name": name,
-        "model": "eSmarter Client",
-        "identifiers": [format!("esmart_{id}")]
-    }));
+    map.insert("device".into(), device_for_entity(id));
     if let Some(dc) = stat.device_class_str() {
         map.insert("device_class".into(), json!(dc));
     }
@@ -248,11 +313,7 @@ async fn send_cover_discovery(
     let config = json!({
         "name": format!("Actuator {node_id}"),
         "unique_id": format!("esmart_actuator_{node_id}"),
-        "device": {
-            "name": format!("eSmart Actuator {node_id}"),
-            "model": "eSmarter Client",
-            "identifiers": [format!("esmart_actuator_{node_id}")]
-        },
+        "device": device_for_entity(&format!("actuator_position_{node_id}")),
         "device_class": "shutter",
         "command_topic": format!("esmart/actuator_{node_id}_position/set"),
         "position_topic": format!("esmart/actuator_position_{node_id}/state"),
@@ -279,11 +340,7 @@ async fn send_climate_discovery(
     let config = json!({
         "name": format!("Room {node_id}"),
         "unique_id": format!("esmart_climate_{node_id}"),
-        "device": {
-            "name": format!("eSmart Room {node_id}"),
-            "model": "eSmarter Client",
-            "identifiers": [format!("esmart_room_{node_id}")]
-        },
+        "device": device_for_entity(&format!("room_temperature_{node_id}")),
         "icon": "mdi:radiator",
         "modes": ["off", "heat"],
         "mode_state_template": "{% if value_json.deviceOnOff == 1.0 %}heat{% else %}off{% endif %}",
@@ -313,11 +370,7 @@ async fn send_fan_discovery(
     let config = json!({
         "name": format!("Fan {node_id}"),
         "unique_id": format!("esmart_fan_{node_id}"),
-        "device": {
-            "name": format!("eSmart Fan {node_id}"),
-            "model": "eSmarter Client",
-            "identifiers": [format!("esmart_fan_{node_id}")]
-        },
+        "device": device_for_entity(&format!("fan_speed_{node_id}")),
         "icon": "mdi:fan",
         "command_topic": format!("esmart/fan_{node_id}_onoff/set"),
         "state_topic": format!("esmart/fan_power_{node_id}/state"),
@@ -347,11 +400,7 @@ async fn send_switch_discovery(
     let config = json!({
         "name": name,
         "unique_id": format!("esmart_{entity_id}"),
-        "device": {
-            "name": format!("eSmart {name}"),
-            "model": "eSmarter Client",
-            "identifiers": [format!("esmart_{entity_id}")]
-        },
+        "device": device_for_entity(entity_id),
         "icon": icon,
         "command_topic": format!("esmart/{entity_id}/set"),
         "state_topic": format!("esmart/{entity_id}/state"),
@@ -380,11 +429,7 @@ async fn send_number_discovery(
     let config = json!({
         "name": name,
         "unique_id": format!("esmart_{entity_id}"),
-        "device": {
-            "name": format!("eSmart {name}"),
-            "model": "eSmarter Client",
-            "identifiers": [format!("esmart_{entity_id}")]
-        },
+        "device": device_for_entity(entity_id),
         "icon": icon,
         "command_topic": format!("esmart/{entity_id}/set"),
         "state_topic": format!("esmart/{entity_id}/state"),
