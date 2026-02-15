@@ -7,7 +7,7 @@ edition = "2021"
 [dependencies]
 chrono = "^0.4"
 tokio-xmpp = { git = "https://gitlab.com/xmpp-rs/xmpp-rs.git", version = "^4.0" }
-tokio = { version = "^1.45", features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "io-std"] }
+tokio = { version = "^1.45", features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "io-std", "sync", "time"] }
 tokio-stream = "^0.1"
 xmpp-parsers = { git = "https://gitlab.com/xmpp-rs/xmpp-rs.git", version = "^0.21" }
 rumqttc = "^0.24"

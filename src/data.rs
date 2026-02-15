@@ -1,4 +1,4 @@
-use crate::stats::{DeviceClass, IterStats, Stat, Unit};
+use crate::stats::{DeviceClass, IterStats, Stat, StatValue, Unit};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +57,12 @@ pub enum OnOff {
     Off,
 }
 
+impl Default for OnOff {
+    fn default() -> Self {
+        OnOff::Off
+    }
+}
+
 impl From<&OnOff> for bool {
     fn from(value: &OnOff) -> bool {
         match value {
@@ -75,10 +81,28 @@ impl Serialize for OnOff {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Deserialize, Debug)]
 struct HolidayMode {
+    #[serde(default)]
     onoff: OnOff,
+}
+
+impl Default for HolidayMode {
+    fn default() -> Self {
+        Self { onoff: OnOff::Off }
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct Freecooling {
+    #[serde(default)]
+    onoff: OnOff,
+}
+
+impl Default for Freecooling {
+    fn default() -> Self {
+        Self { onoff: OnOff::Off }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -151,10 +175,18 @@ pub enum Node {
 
 #[derive(Deserialize, Debug)]
 struct Body {
-    #[allow(dead_code)]
+    #[serde(default)]
     holiday_mode: HolidayMode,
-    #[allow(dead_code)]
+    #[serde(default)]
+    freecooling: Freecooling,
+    #[serde(default)]
+    valves_state: String,
+    #[serde(default)]
     modbus_on_error: String,
+    #[serde(default)]
+    modbus_belimo_on_error: String,
+    #[serde(default)]
+    modbus_ac_on_error: String,
     meters: Vec<Meter>,
     nodes: Vec<Node>,
 }
@@ -188,10 +220,117 @@ impl ESmartMessage {
     pub fn iter_nodes(&self) -> std::slice::Iter<Node> {
         self.body.nodes.iter()
     }
+
+    pub fn holiday_mode_on(&self) -> bool {
+        (&self.body.holiday_mode.onoff).into()
+    }
+
+    pub fn freecooling_on(&self) -> bool {
+        (&self.body.freecooling.onoff).into()
+    }
+
+    pub fn valves_state(&self) -> &str {
+        &self.body.valves_state
+    }
+
+    pub fn modbus_on_error(&self) -> &str {
+        &self.body.modbus_on_error
+    }
+
+    pub fn modbus_belimo_on_error(&self) -> &str {
+        &self.body.modbus_belimo_on_error
+    }
+
+    pub fn modbus_ac_on_error(&self) -> &str {
+        &self.body.modbus_ac_on_error
+    }
+
+    pub fn body_stats(&self) -> Vec<(String, Stat, StatValue)> {
+        vec![
+            (
+                "holiday_mode".to_string(),
+                Stat::new(
+                    "Holiday Mode",
+                    Unit::None,
+                    DeviceClass::None,
+                    "mdi:beach",
+                    "holiday_mode",
+                ),
+                StatValue::Float(if self.holiday_mode_on() { 1.0 } else { 0.0 }),
+            ),
+            (
+                "freecooling".to_string(),
+                Stat::new(
+                    "Freecooling",
+                    Unit::None,
+                    DeviceClass::None,
+                    "mdi:snowflake",
+                    "freecooling",
+                ),
+                StatValue::Float(if self.freecooling_on() { 1.0 } else { 0.0 }),
+            ),
+            (
+                "valves_state".to_string(),
+                Stat::new(
+                    "Valves State",
+                    Unit::None,
+                    DeviceClass::None,
+                    "mdi:valve",
+                    "valves_state",
+                ),
+                StatValue::Text(self.valves_state().to_string()),
+            ),
+            (
+                "modbus_error".to_string(),
+                Stat::new(
+                    "Modbus Error",
+                    Unit::None,
+                    DeviceClass::None,
+                    "mdi:alert-circle",
+                    "modbus_error",
+                ),
+                StatValue::Text(if self.modbus_on_error().is_empty() {
+                    "OK".to_string()
+                } else {
+                    self.modbus_on_error().to_string()
+                }),
+            ),
+            (
+                "modbus_belimo_error".to_string(),
+                Stat::new(
+                    "Modbus Belimo Error",
+                    Unit::None,
+                    DeviceClass::None,
+                    "mdi:alert-circle",
+                    "modbus_belimo_error",
+                ),
+                StatValue::Text(if self.modbus_belimo_on_error().is_empty() {
+                    "OK".to_string()
+                } else {
+                    self.modbus_belimo_on_error().to_string()
+                }),
+            ),
+            (
+                "modbus_ac_error".to_string(),
+                Stat::new(
+                    "Modbus AC Error",
+                    Unit::None,
+                    DeviceClass::None,
+                    "mdi:alert-circle",
+                    "modbus_ac_error",
+                ),
+                StatValue::Text(if self.modbus_ac_on_error().is_empty() {
+                    "OK".to_string()
+                } else {
+                    self.modbus_ac_on_error().to_string()
+                }),
+            ),
+        ]
+    }
 }
 
-impl IterStats<std::vec::IntoIter<(String, Stat, f32)>> for &Meter {
-    fn into_stats_iter(self) -> std::vec::IntoIter<(String, Stat, f32)> {
+impl IterStats<std::vec::IntoIter<(String, Stat, StatValue)>> for &Meter {
+    fn into_stats_iter(self) -> std::vec::IntoIter<(String, Stat, StatValue)> {
         match self {
             Meter::Flow {
                 id,
@@ -206,7 +345,7 @@ impl IterStats<std::vec::IntoIter<(String, Stat, f32)>> for &Meter {
                     "mdi:pipe",
                     "flow_rate",
                 ),
-                *flow_rate,
+                StatValue::Float(*flow_rate),
             )],
             Meter::Power { id, name, power } => {
                 vec![(
@@ -218,7 +357,7 @@ impl IterStats<std::vec::IntoIter<(String, Stat, f32)>> for &Meter {
                         "mdi:lightning-bolt",
                         "power",
                     ),
-                    *power,
+                    StatValue::Float(*power),
                 )]
             }
             Meter::Temperature { id, temperature } => vec![(
@@ -230,15 +369,15 @@ impl IterStats<std::vec::IntoIter<(String, Stat, f32)>> for &Meter {
                     "mdi:thermometer",
                     "temperature",
                 ),
-                *temperature,
+                StatValue::Float(*temperature),
             )],
         }
         .into_iter()
     }
 }
 
-impl IterStats<std::vec::IntoIter<(String, Stat, f32)>> for &Node {
-    fn into_stats_iter(self) -> std::vec::IntoIter<(String, Stat, f32)> {
+impl IterStats<std::vec::IntoIter<(String, Stat, StatValue)>> for &Node {
+    fn into_stats_iter(self) -> std::vec::IntoIter<(String, Stat, StatValue)> {
         match self {
             Node::Room {
                 id,
@@ -247,7 +386,7 @@ impl IterStats<std::vec::IntoIter<(String, Stat, f32)>> for &Node {
                         temperature,
                         device_on_off,
                         power,
-                        ..
+                        setpoint,
                     },
             } => vec![
                 (
@@ -259,7 +398,18 @@ impl IterStats<std::vec::IntoIter<(String, Stat, f32)>> for &Node {
                         "mdi:thermometer",
                         "temperature",
                     ),
-                    *temperature,
+                    StatValue::Float(*temperature),
+                ),
+                (
+                    format!("room_setpoint_{id}"),
+                    Stat::new(
+                        &format!("Room {id} Setpoint"),
+                        Unit::C,
+                        DeviceClass::Temperature,
+                        "mdi:thermometer-chevron-up",
+                        "setpoint",
+                    ),
+                    StatValue::Float(*setpoint),
                 ),
                 (
                     format!("room_heating_on_{id}"),
@@ -267,21 +417,21 @@ impl IterStats<std::vec::IntoIter<(String, Stat, f32)>> for &Node {
                         &format!("Room {id} Heating On"),
                         Unit::None,
                         DeviceClass::None,
-                        "mdi:switch",
+                        "mdi:radiator",
                         "deviceOnOff",
                     ),
-                    if device_on_off.into() { 1.0 } else { 0.0 },
+                    StatValue::Float(if device_on_off.into() { 1.0 } else { 0.0 }),
                 ),
                 (
                     format!("room_heating_power_{id}"),
                     Stat::new(
                         &format!("Room {id} Heating Power"),
                         Unit::None,
-                        DeviceClass::Temperature,
-                        "mdi:thermometer",
+                        DeviceClass::None,
+                        "mdi:radiator",
                         "power",
                     ),
-                    *power,
+                    StatValue::Float(*power),
                 ),
             ]
             .into_iter(),
@@ -298,7 +448,7 @@ impl IterStats<std::vec::IntoIter<(String, Stat, f32)>> for &Node {
                         "mdi:valve",
                         "power",
                     ),
-                    *power,
+                    StatValue::Float(*power),
                 ),
                 (
                     format!("valve_on_{id}"),
@@ -309,24 +459,35 @@ impl IterStats<std::vec::IntoIter<(String, Stat, f32)>> for &Node {
                         "mdi:valve",
                         "onoff",
                     ),
-                    if onoff.into() { 1.0 } else { 0.0 },
+                    StatValue::Float(if onoff.into() { 1.0 } else { 0.0 }),
                 ),
             ]
             .into_iter(),
             Node::Actuator {
                 id,
-                data: ActuatorData { position, power, .. },
+                data: ActuatorData { position, orientation, power },
             } => vec![
                 (
                     format!("actuator_position_{id}"),
                     Stat::new(
                         &format!("Actuator {id} Position"),
-                        Unit::None,
+                        Unit::Percent,
                         DeviceClass::None,
-                        "mdi:valve",
+                        "mdi:window-shutter",
                         "position",
                     ),
-                    *position,
+                    StatValue::Float(*position),
+                ),
+                (
+                    format!("actuator_orientation_{id}"),
+                    Stat::new(
+                        &format!("Actuator {id} Orientation"),
+                        Unit::Percent,
+                        DeviceClass::None,
+                        "mdi:rotate-3d-variant",
+                        "orientation",
+                    ),
+                    StatValue::Float(*orientation),
                 ),
                 (
                     format!("actuator_power_{id}"),
@@ -334,27 +495,51 @@ impl IterStats<std::vec::IntoIter<(String, Stat, f32)>> for &Node {
                         &format!("Actuator {id} Power"),
                         Unit::None,
                         DeviceClass::None,
-                        "mdi:valve",
+                        "mdi:window-shutter",
                         "power",
                     ),
-                    *power,
+                    StatValue::Float(*power),
                 ),
             ]
             .into_iter(),
             Node::Fan {
                 id,
-                data: FanData { power, .. },
-            } => vec![(
-                format!("fan_power_{id}"),
-                Stat::new(
-                    &format!("Fan {id} Power"),
-                    Unit::None,
-                    DeviceClass::None,
-                    "mdi:fan",
-                    "power",
+                data: FanData { speed, power, mode },
+            } => vec![
+                (
+                    format!("fan_speed_{id}"),
+                    Stat::new(
+                        &format!("Fan {id} Speed"),
+                        Unit::None,
+                        DeviceClass::None,
+                        "mdi:fan",
+                        "speed",
+                    ),
+                    StatValue::Text(speed.clone()),
                 ),
-                *power,
-            )]
+                (
+                    format!("fan_mode_{id}"),
+                    Stat::new(
+                        &format!("Fan {id} Mode"),
+                        Unit::None,
+                        DeviceClass::None,
+                        "mdi:fan",
+                        "mode",
+                    ),
+                    StatValue::Text(mode.clone()),
+                ),
+                (
+                    format!("fan_power_{id}"),
+                    Stat::new(
+                        &format!("Fan {id} Power"),
+                        Unit::None,
+                        DeviceClass::None,
+                        "mdi:fan",
+                        "power",
+                    ),
+                    StatValue::Float(*power),
+                ),
+            ]
             .into_iter(),
             Node::Unknown(v) => {
                 log::debug!("Unknown node type: {:?}", v);

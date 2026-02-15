@@ -9,21 +9,25 @@ use clap::Parser;
 use data::{Meter, Node};
 use rumqttc::{AsyncClient, ClientError, MqttOptions};
 use serde_json::json;
-use stats::{IterStats, Stat};
-use tokio::sync::broadcast::{self, Receiver, Sender};
+use stats::{IterStats, Stat, StatValue};
+use tokio::sync::{
+    broadcast::{self, Receiver, Sender},
+    mpsc,
+};
 use tokio_stream::StreamExt;
 use tokio_xmpp::{Client, Error, Event};
 use xmpp_parsers::{
-    message::Message,
+    message::{Body as MessageBody, Message, MessageType},
     muc::Muc,
     presence::{Presence, Show as PresenceShow, Type as PresenceType},
 };
 
 mod cli;
+mod commands;
 mod data;
 mod stats;
 
-type ChannelMessage = (String, Stat, f32);
+type ChannelMessage = (String, Stat, StatValue);
 
 fn process_meter(queue: &mut Sender<ChannelMessage>, meter: &Meter) {
     for (id, stat, value) in meter.into_stats_iter() {
@@ -90,10 +94,13 @@ async fn send_mqtt_update(
     client: &mut AsyncClient,
     id: &str,
     property: &str,
-    value: f32,
+    value: &StatValue,
 ) -> Result<(), ClientError> {
     let topic = format!("esmart/{id}/state");
-    let json = json!({ property: value });
+    let json = match value {
+        StatValue::Float(v) => json!({ property: v }),
+        StatValue::Text(v) => json!({ property: v }),
+    };
 
     log::debug!("Sending data payload to '{}': {}", topic, json);
     client
@@ -105,6 +112,7 @@ async fn send_mqtt_update(
 
 async fn xmpp_task(
     mut sender: Sender<ChannelMessage>,
+    cmd_receiver: &mut mpsc::Receiver<commands::ESmartCommand>,
     args: Arc<cli::Cli>,
     messages_recv: Arc<AtomicU64>,
 ) -> Result<(), Error> {
@@ -115,54 +123,82 @@ async fn xmpp_task(
         args.xmpp_password.clone(),
     );
 
-    while let Some(elem) = client.next().await {
-        match elem {
-            Event::Stanza(stanza) => match Message::try_from(stanza) {
-                Ok(message) => {
-                    if let Some((_, body)) = message.get_best_body(vec![""]) {
-                        log::debug!("Raw XMPP message body: {}", body);
-                        match serde_json::from_str::<data::ESmartMessage>(body) {
-                            Ok(msg) => {
-                                messages_recv.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                                msg.iter_meters()
-                                    .for_each(|meter| process_meter(&mut sender, meter));
-                                msg.iter_nodes()
-                                    .for_each(|node| process_node(&mut sender, node));
+    loop {
+        tokio::select! {
+            elem = client.next() => {
+                let Some(elem) = elem else { break };
+                match elem {
+                    Event::Stanza(stanza) => match Message::try_from(stanza) {
+                        Ok(message) => {
+                            if let Some((_, body)) = message.get_best_body(vec![""]) {
+                                log::debug!("Raw XMPP message body: {}", body);
+                                match serde_json::from_str::<data::ESmartMessage>(body) {
+                                    Ok(msg) => {
+                                        messages_recv.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                                        msg.iter_meters()
+                                            .for_each(|meter| process_meter(&mut sender, meter));
+                                        msg.iter_nodes()
+                                            .for_each(|node| process_node(&mut sender, node));
+                                        for (id, stat, value) in msg.body_stats() {
+                                            match sender.send((id, stat, value)) {
+                                                Ok(_) => {}
+                                                Err(_) => log::error!("Failed to send body stat"),
+                                            }
+                                        }
+                                    }
+                                    Err(e) => log::warn!("Failed to parse ESmartMessage: {:?}", e),
+                                }
                             }
-                            Err(e) => log::warn!("Failed to parse ESmartMessage: {:?}", e),
                         }
+                        Err(_) => continue,
+                    },
+                    Event::Disconnected(e) => {
+                        log::error!("XMPP client disconnected: {:?}", e);
+                        return Err(Error::Disconnected);
+                    }
+                    Event::Online { .. } => {
+                        let mut presence = Presence::new(PresenceType::None);
+                        presence.show = Some(PresenceShow::Chat);
+                        client.send_stanza(presence.into()).await?;
+
+                        let muc = Muc::new();
+                        let room_jid = match args
+                            .xmpp_room
+                            .with_resource_str(&args.xmpp_nickname)
+                        {
+                            Ok(jid) => jid,
+                            Err(e) => {
+                                log::error!(
+                                    "Failed to construct room JID with nickname '{}': {:?}",
+                                    args.xmpp_nickname,
+                                    e
+                                );
+                                continue;
+                            }
+                        };
+                        let mut presence = Presence::new(PresenceType::None).with_to(room_jid);
+                        presence.add_payload(muc);
+                        presence.set_status("en", "here");
+                        let _ = client.send_stanza(presence.into()).await;
                     }
                 }
-                Err(_) => continue,
-            },
-            Event::Disconnected(e) => {
-                log::error!("XMPP client disconnected: {:?}", e);
-                return Err(Error::Disconnected);
             }
-            Event::Online { .. } => {
-                let mut presence = Presence::new(PresenceType::None);
-                presence.show = Some(PresenceShow::Chat);
-                client.send_stanza(presence.into()).await?;
-
-                let muc = Muc::new();
-                let room_jid = match args
-                    .xmpp_room
-                    .with_resource_str(&args.xmpp_nickname)
-                {
-                    Ok(jid) => jid,
-                    Err(e) => {
-                        log::error!(
-                            "Failed to construct room JID with nickname '{}': {:?}",
-                            args.xmpp_nickname,
-                            e
-                        );
-                        continue;
-                    }
+            cmd = cmd_receiver.recv() => {
+                let Some(cmd) = cmd else {
+                    log::warn!("Command channel closed");
+                    break;
                 };
-                let mut presence = Presence::new(PresenceType::None).with_to(room_jid);
-                presence.add_payload(muc);
-                presence.set_status("en", "here");
-                let _ = client.send_stanza(presence.into()).await;
+                log::info!("Sending command to eSmart: {}", cmd.description);
+                log::debug!("Command XMPP payload: {}", cmd.xmpp_payload);
+                let mut message = Message::new(Some(args.xmpp_room.clone().into()));
+                message.type_ = MessageType::Groupchat;
+                message.bodies.insert(
+                    String::new(),
+                    MessageBody(cmd.xmpp_payload.clone()),
+                );
+                if let Err(e) = client.send_stanza(message.into()).await {
+                    log::error!("Failed to send XMPP command: {:?}", e);
+                }
             }
         }
     }
@@ -170,14 +206,141 @@ async fn xmpp_task(
     Ok(())
 }
 
+async fn send_cover_discovery(
+    client: &mut AsyncClient,
+    node_id: u16,
+) -> Result<(), ClientError> {
+    let id = format!("actuator_{node_id}");
+    let config_topic = format!("homeassistant/cover/esmart/{id}/config");
+    let config = json!({
+        "name": format!("Actuator {node_id}"),
+        "unique_id": format!("esmart_actuator_{node_id}"),
+        "device": {
+            "name": format!("eSmart Actuator {node_id}"),
+            "model": "eSmarter Client",
+            "identifiers": [format!("esmart_actuator_{node_id}")]
+        },
+        "icon": "mdi:window-shutter",
+        "position_topic": format!("esmart/actuator_position_{node_id}/state"),
+        "position_template": "{{ value_json.position | int }}",
+        "set_position_topic": format!("esmart/actuator_{node_id}_position/set"),
+        "tilt_status_topic": format!("esmart/actuator_orientation_{node_id}/state"),
+        "tilt_status_template": "{{ value_json.orientation | int }}",
+        "tilt_command_topic": format!("esmart/actuator_{node_id}_tilt/set"),
+        "position_open": 100,
+        "position_closed": 0
+    });
+    log::debug!("Sending cover discovery to '{}': {}", config_topic, config);
+    client
+        .publish(config_topic, rumqttc::QoS::AtLeastOnce, true, config.to_string())
+        .await
+}
+
+async fn send_climate_discovery(
+    client: &mut AsyncClient,
+    node_id: u16,
+) -> Result<(), ClientError> {
+    let id = format!("room_{node_id}");
+    let config_topic = format!("homeassistant/climate/esmart/{id}/config");
+    let config = json!({
+        "name": format!("Room {node_id}"),
+        "unique_id": format!("esmart_climate_{node_id}"),
+        "device": {
+            "name": format!("eSmart Room {node_id}"),
+            "model": "eSmarter Client",
+            "identifiers": [format!("esmart_room_{node_id}")]
+        },
+        "icon": "mdi:radiator",
+        "modes": ["off", "heat"],
+        "mode_command_topic": format!("esmart/room_{node_id}_mode/set"),
+        "mode_state_template": "{% if value_json.deviceOnOff == 1.0 %}heat{% else %}off{% endif %}",
+        "mode_state_topic": format!("esmart/room_heating_on_{node_id}/state"),
+        "temperature_command_topic": format!("esmart/room_{node_id}_setpoint/set"),
+        "temperature_state_topic": format!("esmart/room_setpoint_{node_id}/state"),
+        "temperature_state_template": "{{ value_json.setpoint }}",
+        "current_temperature_topic": format!("esmart/room_temperature_{node_id}/state"),
+        "current_temperature_template": "{{ value_json.temperature }}",
+        "min_temp": 5,
+        "max_temp": 30,
+        "temp_step": 0.5,
+        "temperature_unit": "C"
+    });
+    log::debug!("Sending climate discovery to '{}': {}", config_topic, config);
+    client
+        .publish(config_topic, rumqttc::QoS::AtLeastOnce, true, config.to_string())
+        .await
+}
+
+async fn send_fan_discovery(
+    client: &mut AsyncClient,
+    node_id: u16,
+) -> Result<(), ClientError> {
+    let id = format!("fan_{node_id}");
+    let config_topic = format!("homeassistant/fan/esmart/{id}/config");
+    let config = json!({
+        "name": format!("Fan {node_id}"),
+        "unique_id": format!("esmart_fan_{node_id}"),
+        "device": {
+            "name": format!("eSmart Fan {node_id}"),
+            "model": "eSmarter Client",
+            "identifiers": [format!("esmart_fan_{node_id}")]
+        },
+        "icon": "mdi:fan",
+        "command_topic": format!("esmart/fan_{node_id}_onoff/set"),
+        "state_topic": format!("esmart/fan_power_{node_id}/state"),
+        "state_value_template": "{% if value_json.power > 0 %}ON{% else %}OFF{% endif %}",
+        "percentage_command_topic": format!("esmart/fan_{node_id}_speed/set"),
+        "preset_mode_command_topic": format!("esmart/fan_{node_id}_mode/set"),
+        "preset_modes": ["auto", "manual"]
+    });
+    log::debug!("Sending fan discovery to '{}': {}", config_topic, config);
+    client
+        .publish(config_topic, rumqttc::QoS::AtLeastOnce, true, config.to_string())
+        .await
+}
+
+async fn send_switch_discovery(
+    client: &mut AsyncClient,
+    entity_id: &str,
+    name: &str,
+    icon: &str,
+    state_property: &str,
+) -> Result<(), ClientError> {
+    let config_topic = format!("homeassistant/switch/esmart/{entity_id}/config");
+    let value_tpl = format!(
+        "{{% if value_json.{} == 1.0 %}}ON{{% else %}}OFF{{% endif %}}",
+        state_property
+    );
+    let config = json!({
+        "name": name,
+        "unique_id": format!("esmart_{entity_id}"),
+        "device": {
+            "name": format!("eSmart {name}"),
+            "model": "eSmarter Client",
+            "identifiers": [format!("esmart_{entity_id}")]
+        },
+        "icon": icon,
+        "command_topic": format!("esmart/{entity_id}/set"),
+        "state_topic": format!("esmart/{entity_id}/state"),
+        "value_template": value_tpl,
+        "payload_on": "ON",
+        "payload_off": "OFF"
+    });
+    log::debug!("Sending switch discovery to '{}': {}", config_topic, config);
+    client
+        .publish(config_topic, rumqttc::QoS::AtLeastOnce, true, config.to_string())
+        .await
+}
+
 // task which fetches the stats from the queue and sends them to MQTT
 async fn mqtt_task(
     mut receiver: Receiver<ChannelMessage>,
+    cmd_sender: mpsc::Sender<commands::ESmartCommand>,
     args: Arc<cli::Cli>,
     messages_sent: Arc<AtomicU64>,
 ) {
     let mut last_contact: HashMap<String, DateTime<Utc>> = HashMap::new();
-    let mut cache_queues: HashMap<String, Vec<f32>> = HashMap::new();
+    let mut cache_queues: HashMap<String, Vec<StatValue>> = HashMap::new();
 
     let mut options = MqttOptions::new(&args.mqtt_id, &args.mqtt_hostname, args.mqtt_port);
 
@@ -187,12 +350,15 @@ async fn mqtt_task(
         match &args.mqtt_password {
             Some(password) => {
                 options.set_credentials(username, password);
+                log::info!("MQTT: connecting with authentication (user: {})", username);
             }
             None => {
                 log::error!("MQTT username is set but password is missing!");
                 return;
             }
         }
+    } else {
+        log::info!("MQTT: connecting without authentication");
     }
 
     options.set_keep_alive(Duration::from_secs(5));
@@ -200,6 +366,10 @@ async fn mqtt_task(
     let (client, mut event_loop) = AsyncClient::new(options, 10);
 
     let mqtt_throttling_secs = args.mqtt_throttling_secs as i64;
+    let jid = args.xmpp_jid.to_string();
+
+    // Track which control entities we've already sent discovery for
+    let mut control_discovery_sent: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // spawn a task to handle incoming messages from the XMPP client
     let mut client_clone = client.clone();
@@ -209,6 +379,37 @@ async fn mqtt_task(
                 Ok((id, stat, value)) => {
                     log::debug!("Processing update for {id}");
 
+                    // Send control entity discovery on first sight of controllable nodes
+                    if !control_discovery_sent.contains(&id) {
+                        if let Some(node_id) = id.strip_prefix("room_temperature_").and_then(|s| s.parse::<u16>().ok()) {
+                            if let Err(e) = send_climate_discovery(&mut client_clone, node_id).await {
+                                log::error!("Error sending climate discovery: {:?}", e);
+                            }
+                            control_discovery_sent.insert(id.clone());
+                        } else if let Some(node_id) = id.strip_prefix("actuator_position_").and_then(|s| s.parse::<u16>().ok()) {
+                            if let Err(e) = send_cover_discovery(&mut client_clone, node_id).await {
+                                log::error!("Error sending cover discovery: {:?}", e);
+                            }
+                            control_discovery_sent.insert(id.clone());
+                        } else if let Some(node_id) = id.strip_prefix("fan_power_").and_then(|s| s.parse::<u16>().ok()) {
+                            if let Err(e) = send_fan_discovery(&mut client_clone, node_id).await {
+                                log::error!("Error sending fan discovery: {:?}", e);
+                            }
+                            control_discovery_sent.insert(id.clone());
+                        } else if id == "holiday_mode" {
+                            if let Err(e) = send_switch_discovery(&mut client_clone, "holiday_mode", "Holiday Mode", "mdi:beach", "holiday_mode").await {
+                                log::error!("Error sending holiday mode switch discovery: {:?}", e);
+                            }
+                            control_discovery_sent.insert(id.clone());
+                        } else if id == "freecooling" {
+                            if let Err(e) = send_switch_discovery(&mut client_clone, "freecooling", "Freecooling", "mdi:snowflake", "freecooling").await {
+                                log::error!("Error sending freecooling switch discovery: {:?}", e);
+                            }
+                            control_discovery_sent.insert(id.clone());
+                        }
+                    }
+
+                    let value_clone = value.clone();
                     match cache_queues.get_mut(&id) {
                         Some(queue) => queue.push(value),
                         None => {
@@ -216,7 +417,7 @@ async fn mqtt_task(
                             {
                                 log::error!("Error sending discovery message: {:?}", e);
                             }
-                            cache_queues.insert(id.clone(), Vec::new());
+                            cache_queues.insert(id.clone(), vec![value]);
                         }
                     }
 
@@ -228,17 +429,28 @@ async fn mqtt_task(
                     };
 
                     if send_message {
-                        let queue = cache_queues.get_mut(&id).unwrap();
-                        let avg = if !queue.is_empty() {
-                            queue.iter().fold(0.0, |acc, e| acc + *e) / queue.len() as f32
+                        let queue = cache_queues.get_mut(&id).expect("cache queue missing after insert");
+                        let resolved = if !queue.is_empty() {
+                            match &queue[0] {
+                                StatValue::Float(_) => {
+                                    let sum: f32 = queue.iter().map(|v| match v {
+                                        StatValue::Float(f) => *f,
+                                        _ => 0.0,
+                                    }).sum();
+                                    StatValue::Float(sum / queue.len() as f32)
+                                }
+                                StatValue::Text(_) => {
+                                    queue.last().cloned().unwrap_or(StatValue::Text(String::new()))
+                                }
+                            }
                         } else {
-                            0.0
+                            value_clone
                         };
 
                         queue.clear();
                         let _ = last_contact.insert(id.clone(), Utc::now());
                         if let Err(e) =
-                            send_mqtt_update(&mut client_clone, &id, stat.property(), avg).await
+                            send_mqtt_update(&mut client_clone, &id, stat.property(), &resolved).await
                         {
                             log::error!("Error sending update message: {:?}", e);
                         } else {
@@ -257,9 +469,39 @@ async fn mqtt_task(
         }
     });
 
-    // Main MQTT event loop: exit on error
+    // Main MQTT event loop: handle notifications including incoming Publish (commands from HA)
+    let mut cmd_client = client.clone();
     loop {
         match event_loop.poll().await {
+            Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_))) => {
+                log::info!("MQTT connected, subscribing to command topics");
+                if let Err(e) = cmd_client.subscribe("esmart/+/set", rumqttc::QoS::AtLeastOnce).await {
+                    log::error!("Failed to subscribe to command topics: {:?}", e);
+                } else {
+                    log::info!("Subscribed to esmart/+/set for HA commands");
+                }
+            }
+            Ok(rumqttc::Event::Incoming(rumqttc::Packet::Publish(publish))) => {
+                let topic = publish.topic.clone();
+                let payload = match std::str::from_utf8(&publish.payload) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => {
+                        log::warn!("Non-UTF8 payload on topic {}", topic);
+                        continue;
+                    }
+                };
+                log::info!("Received MQTT command: topic={} payload={}", topic, payload);
+                match commands::parse_mqtt_command(&jid, &topic, &payload) {
+                    Some(cmd) => {
+                        if let Err(e) = cmd_sender.send(cmd).await {
+                            log::error!("Failed to send command to XMPP task: {:?}", e);
+                        }
+                    }
+                    None => {
+                        log::warn!("Could not parse command from topic={} payload={}", topic, payload);
+                    }
+                }
+            }
             Ok(notification) => {
                 log::trace!("Received = {:?}", notification);
             }
@@ -304,11 +546,15 @@ async fn main() {
     let receiver_clone = receiver.resubscribe();
     let messages_sent_clone = messages_sent.clone();
 
+    // Command channel: MQTT task sends commands, XMPP task receives and forwards to eSmart
+    let (cmd_sender, cmd_receiver) = mpsc::channel::<commands::ESmartCommand>(64);
+
     // Spawn XMPP task
     let xmpp_handle = tokio::spawn(async move {
+        let mut cmd_rx = cmd_receiver;
         loop {
             log::info!("Starting XMPP task");
-            xmpp_task(sender.clone(), args_clone.clone(), messages_recv.clone())
+            xmpp_task(sender.clone(), &mut cmd_rx, args_clone.clone(), messages_recv.clone())
                 .await
                 .unwrap_or_else(|e| {
                     log::error!("XMPP task failed: {:?}", e);
@@ -324,6 +570,7 @@ async fn main() {
             log::info!("Starting MQTT task");
             mqtt_task(
                 receiver_clone.resubscribe(),
+                cmd_sender.clone(),
                 args.clone(),
                 messages_sent_clone.clone(),
             )

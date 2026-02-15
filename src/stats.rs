@@ -4,6 +4,13 @@ pub enum Unit {
     C,
     Lmin,
     W,
+    Percent,
+}
+
+#[derive(Clone, Debug)]
+pub enum StatValue {
+    Float(f32),
+    Text(String),
 }
 
 #[derive(Clone)]
@@ -67,6 +74,7 @@ impl Stat {
             Unit::C => Some("°C"),
             Unit::Lmin => Some("L/min"),
             Unit::W => Some("W"),
+            Unit::Percent => Some("%"),
         }
     }
 }
