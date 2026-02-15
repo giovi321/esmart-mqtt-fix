@@ -307,16 +307,41 @@ pub fn parse_mqtt_command(
         // Conversion: esmart = round((100 - ha) / 100 * 1024)
         if let Some(id_str) = rest.strip_suffix("_tilt") {
             if let Ok(node_id) = id_str.parse::<u16>() {
-                // HA sends STOP to tilt topic too; ignore it (position STOP handles stopping)
+                // HA may send STOP to tilt topic instead of (or in addition to) position topic.
+                // Perform the same stop logic: estimate position, send both position+orientation.
                 if payload.trim().eq_ignore_ascii_case("STOP") {
-                    return ParseResult::Handled;
+                    let (estimated_ha, es_orient) = if let Ok(mut states) = actuator_states.lock() {
+                        let state = states.entry(node_id).or_insert_with(ActuatorState::new);
+                        let pos = state.estimate_position();
+                        let orient = ((100.0 - state.ha_orientation.clamp(0.0, 100.0)) / 100.0 * 1024.0).round() as i32;
+                        state.in_flight = None;
+                        (pos, orient)
+                    } else {
+                        (50.0, 512)
+                    };
+                    let es_pos = ((100.0 - estimated_ha.clamp(0.0, 100.0)) / 100.0 * 1024.0).round() as i32;
+                    log::info!("STOP actuator {} (via tilt): estimated HA pos {:.1}%, eSmart pos {}, orientation {}", node_id, estimated_ha, es_pos, es_orient);
+                    return ParseResult::Command(ESmartCommand {
+                        xmpp_payload: set_node(jid, node_id, json!({"position": es_pos, "orientation": es_orient})),
+                        description: format!("Stop actuator {} via tilt (estimated HA {:.0}% → eSmart pos {} orient {})", node_id, estimated_ha, es_pos, es_orient),
+                    });
                 }
                 if let Ok(ha_tilt) = payload.trim().parse::<f32>() {
                     let ha_clamped = ha_tilt.clamp(0.0, 100.0);
                     let es_orient = ((100.0 - ha_clamped) / 100.0 * 1024.0).round() as i32;
+                    // Device requires both position and orientation together.
+                    // Use estimated position (not ha_position) because the device
+                    // reports the target position immediately while still moving.
+                    let es_pos = if let Ok(states) = actuator_states.lock() {
+                        let state = states.get(&node_id);
+                        let ha_pos = state.map(|s| s.estimate_position()).unwrap_or(0.0);
+                        ((100.0 - ha_pos.clamp(0.0, 100.0)) / 100.0 * 1024.0).round() as i32
+                    } else {
+                        512
+                    };
                     return ParseResult::Command(ESmartCommand {
-                        xmpp_payload: set_node(jid, node_id, json!({"orientation": es_orient})),
-                        description: format!("Set actuator {} tilt to eSmart orientation {}", node_id, es_orient),
+                        xmpp_payload: set_node(jid, node_id, json!({"position": es_pos, "orientation": es_orient})),
+                        description: format!("Set actuator {} tilt to eSmart orientation {} (keeping pos {})", node_id, es_orient, es_pos),
                     });
                 }
             }
