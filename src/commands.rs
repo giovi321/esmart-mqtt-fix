@@ -131,21 +131,24 @@ pub fn parse_mqtt_command(jid: &str, topic: &str, payload: &str) -> Option<ESmar
         if let Some(id_str) = rest.strip_suffix("_mode") {
             if let Ok(node_id) = id_str.parse::<u16>() {
                 let mode = payload.trim().to_lowercase();
-                let on = match mode.as_str() {
-                    "heat" | "on" => true,
-                    "off" => false,
+                // eSmart doesn't accept direct onoff commands for rooms.
+                // The device auto-manages on/off based on setpoint vs temperature.
+                // "off" → set setpoint to minimum (5°C) to effectively disable heating.
+                // "heat" → set setpoint to a reasonable default (21°C) to enable heating.
+                let (setpoint, desc) = match mode.as_str() {
+                    "heat" | "on" => (21.0, "on (setpoint 21°C)"),
+                    "off" => (5.0, "off (setpoint 5°C)"),
                     _ => return None,
                 };
                 return Some(ESmartCommand {
                     xmpp_payload: set_node(
                         jid,
                         node_id,
-                        json!({"onoff": if on { "on" } else { "off" }}),
+                        json!({"setpoint": setpoint}),
                     ),
                     description: format!(
                         "Set room {} heating to {}",
-                        node_id,
-                        if on { "on" } else { "off" }
+                        node_id, desc
                     ),
                 });
             }
@@ -153,22 +156,25 @@ pub fn parse_mqtt_command(jid: &str, topic: &str, payload: &str) -> Option<ESmar
     }
 
     // Actuator cover commands: actuator_<id>_position, actuator_<id>_tilt
-    // Real app uses 0-1024 range; HA cover uses 0-100. We scale accordingly.
+    // HA uses 0-100 (100=open, 0=closed); eSmart uses 0-1024 (0=open, 1024=closed).
+    // Conversion: esmart = ((100 - ha) / 100 * 1024).round()
     if let Some(rest) = entity_id.strip_prefix("actuator_") {
         if let Some(id_str) = rest.strip_suffix("_position") {
             if let Ok(node_id) = id_str.parse::<u16>() {
                 let trimmed = payload.trim();
                 match trimmed.to_uppercase().as_str() {
                     "OPEN" => {
+                        // eSmart 0 = fully open
                         return Some(ESmartCommand {
-                            xmpp_payload: set_node(jid, node_id, json!({"position": 1024, "orientation": 1024})),
-                            description: format!("Open actuator {} (position 1024)", node_id),
+                            xmpp_payload: set_node(jid, node_id, json!({"position": 0, "orientation": 0})),
+                            description: format!("Open actuator {} (eSmart position 0)", node_id),
                         });
                     }
                     "CLOSE" => {
+                        // eSmart 1024 = fully closed
                         return Some(ESmartCommand {
-                            xmpp_payload: set_node(jid, node_id, json!({"position": 0, "orientation": 0})),
-                            description: format!("Close actuator {} (position 0)", node_id),
+                            xmpp_payload: set_node(jid, node_id, json!({"position": 1024, "orientation": 1024})),
+                            description: format!("Close actuator {} (eSmart position 1024)", node_id),
                         });
                     }
                     "STOP" => {
@@ -178,12 +184,12 @@ pub fn parse_mqtt_command(jid: &str, topic: &str, payload: &str) -> Option<ESmar
                         });
                     }
                     _ => {
-                        if let Ok(pos) = trimmed.parse::<f32>() {
-                            // HA sends 0-100, scale to 0-1024
-                            let pos = ((pos.clamp(0.0, 100.0) / 100.0) * 1024.0).round() as i32;
+                        if let Ok(ha_pos) = trimmed.parse::<f32>() {
+                            // Invert and scale: HA 100=open → eSmart 0=open
+                            let es_pos = ((100.0 - ha_pos.clamp(0.0, 100.0)) / 100.0 * 1024.0).round() as i32;
                             return Some(ESmartCommand {
-                                xmpp_payload: set_node(jid, node_id, json!({"position": pos, "orientation": pos})),
-                                description: format!("Set actuator {} position to {}", node_id, pos),
+                                xmpp_payload: set_node(jid, node_id, json!({"position": es_pos, "orientation": es_pos})),
+                                description: format!("Set actuator {} position to eSmart {}", node_id, es_pos),
                             });
                         }
                     }
@@ -196,14 +202,14 @@ pub fn parse_mqtt_command(jid: &str, topic: &str, payload: &str) -> Option<ESmar
                 match trimmed.to_uppercase().as_str() {
                     "OPEN" => {
                         return Some(ESmartCommand {
-                            xmpp_payload: set_node(jid, node_id, json!({"orientation": 1024})),
-                            description: format!("Open actuator {} tilt (orientation 1024)", node_id),
+                            xmpp_payload: set_node(jid, node_id, json!({"orientation": 0})),
+                            description: format!("Open actuator {} tilt (eSmart orientation 0)", node_id),
                         });
                     }
                     "CLOSE" => {
                         return Some(ESmartCommand {
-                            xmpp_payload: set_node(jid, node_id, json!({"orientation": 0})),
-                            description: format!("Close actuator {} tilt (orientation 0)", node_id),
+                            xmpp_payload: set_node(jid, node_id, json!({"orientation": 1024})),
+                            description: format!("Close actuator {} tilt (eSmart orientation 1024)", node_id),
                         });
                     }
                     "STOP" => {
@@ -213,14 +219,14 @@ pub fn parse_mqtt_command(jid: &str, topic: &str, payload: &str) -> Option<ESmar
                         });
                     }
                     _ => {
-                        if let Ok(tilt) = trimmed.parse::<f32>() {
-                            // HA sends 0-100, scale to 0-1024
-                            let tilt = ((tilt.clamp(0.0, 100.0) / 100.0) * 1024.0).round() as i32;
+                        if let Ok(ha_tilt) = trimmed.parse::<f32>() {
+                            // Invert and scale: HA 100=open → eSmart 0=open
+                            let es_tilt = ((100.0 - ha_tilt.clamp(0.0, 100.0)) / 100.0 * 1024.0).round() as i32;
                             return Some(ESmartCommand {
-                                xmpp_payload: set_node(jid, node_id, json!({"orientation": tilt})),
+                                xmpp_payload: set_node(jid, node_id, json!({"orientation": es_tilt})),
                                 description: format!(
-                                    "Set actuator {} orientation to {}",
-                                    node_id, tilt
+                                    "Set actuator {} orientation to eSmart {}",
+                                    node_id, es_tilt
                                 ),
                             });
                         }

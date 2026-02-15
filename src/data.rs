@@ -466,7 +466,12 @@ impl IterStats<std::vec::IntoIter<(String, Stat, StatValue)>> for &Node {
             Node::Actuator {
                 id,
                 data: ActuatorData { position, orientation, power },
-            } => vec![
+            } => {
+                // eSmart uses 0-1024: 0=fully open, 1024=fully closed
+                // HA uses 0-100: 0=closed, 100=open — so we invert and scale
+                let ha_position = ((1024.0 - position) / 1024.0 * 100.0).round();
+                let ha_orientation = ((1024.0 - orientation) / 1024.0 * 100.0).round();
+                vec![
                 (
                     format!("actuator_position_{id}"),
                     Stat::new(
@@ -476,7 +481,7 @@ impl IterStats<std::vec::IntoIter<(String, Stat, StatValue)>> for &Node {
                         "mdi:window-shutter",
                         "position",
                     ),
-                    StatValue::Float(*position),
+                    StatValue::Float(ha_position),
                 ),
                 (
                     format!("actuator_orientation_{id}"),
@@ -487,7 +492,7 @@ impl IterStats<std::vec::IntoIter<(String, Stat, StatValue)>> for &Node {
                         "mdi:rotate-3d-variant",
                         "orientation",
                     ),
-                    StatValue::Float(*orientation),
+                    StatValue::Float(ha_orientation),
                 ),
                 (
                     format!("actuator_power_{id}"),
@@ -501,7 +506,7 @@ impl IterStats<std::vec::IntoIter<(String, Stat, StatValue)>> for &Node {
                     StatValue::Float(*power),
                 ),
             ]
-            .into_iter(),
+            }.into_iter(),
             Node::Fan {
                 id,
                 data: FanData { speed, power, mode },

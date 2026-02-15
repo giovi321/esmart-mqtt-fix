@@ -132,14 +132,35 @@ async fn xmpp_task(
                         Ok(message) => {
                             if let Some((_, body)) = message.get_best_body(vec![""]) {
                                 log::debug!("Raw XMPP message body: {}", body);
-                                // Skip non-INFO messages (SET echoes, CMD echoes, etc.)
-                                // Only INFO messages contain the full data payload we need to parse.
-                                if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(body) {
-                                    let method = envelope.pointer("/headers/method").and_then(|v| v.as_str());
-                                    if method != Some("INFO") {
-                                        log::debug!("Ignoring non-INFO message (method={:?})", method);
+                                // Skip non-JSON messages (e.g. MUC room invitations)
+                                let body_trimmed = body.trim();
+                                if !body_trimmed.starts_with('{') {
+                                    log::debug!("Ignoring non-JSON XMPP message");
+                                    continue;
+                                }
+                                // Pre-parse to check headers before full deserialization
+                                let envelope = match serde_json::from_str::<serde_json::Value>(body) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        log::warn!("Failed to parse XMPP message as JSON: {:?}", e);
                                         continue;
                                     }
+                                };
+                                let method = envelope.pointer("/headers/method").and_then(|v| v.as_str());
+                                let msg_type = envelope.pointer("/headers/type").and_then(|v| v.as_str());
+                                // Only INFO/data messages contain the full payload we need
+                                if method != Some("INFO") {
+                                    log::debug!("Ignoring non-INFO message (method={:?})", method);
+                                    continue;
+                                }
+                                if msg_type != Some("data") {
+                                    // Error responses, operation echoes, etc.
+                                    if let Some(error) = envelope.pointer("/error/message") {
+                                        log::warn!("eSmart error response: {}", error);
+                                    } else {
+                                        log::debug!("Ignoring INFO message with type={:?}", msg_type);
+                                    }
+                                    continue;
                                 }
                                 match serde_json::from_str::<data::ESmartMessage>(body) {
                                     Ok(msg) => {
@@ -221,7 +242,7 @@ async fn send_cover_discovery(
 ) -> Result<(), ClientError> {
     let id = format!("actuator_{node_id}");
     let config_topic = format!("homeassistant/cover/esmart/{id}/config");
-    // eSmart uses 0-1024 range; HA covers use 0-100. Scale in templates.
+    // Position/orientation are already scaled to 0-100 and direction-inverted in data.rs
     let config = json!({
         "name": format!("Actuator {node_id}"),
         "unique_id": format!("esmart_actuator_{node_id}"),
@@ -232,10 +253,10 @@ async fn send_cover_discovery(
         },
         "icon": "mdi:window-shutter",
         "position_topic": format!("esmart/actuator_position_{node_id}/state"),
-        "position_template": "{{ (value_json.position | float / 1024.0 * 100.0) | round(0) | int }}",
+        "position_template": "{{ value_json.position | int }}",
         "set_position_topic": format!("esmart/actuator_{node_id}_position/set"),
         "tilt_status_topic": format!("esmart/actuator_orientation_{node_id}/state"),
-        "tilt_status_template": "{{ (value_json.orientation | float / 1024.0 * 100.0) | round(0) | int }}",
+        "tilt_status_template": "{{ value_json.orientation | int }}",
         "tilt_command_topic": format!("esmart/actuator_{node_id}_tilt/set"),
         "position_open": 100,
         "position_closed": 0
