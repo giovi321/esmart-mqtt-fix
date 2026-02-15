@@ -518,7 +518,7 @@ async fn mqtt_task(
                 Ok((id, stat, value)) => {
                     log::debug!("Processing update for {id}");
 
-                    // Track actuator positions (HA 0-100 scale) for STOP estimation.
+                    // Track actuator positions and orientations (HA 0-100 scale) for STOP estimation.
                     // NOTE: Do NOT clear in_flight here. The device immediately reports
                     // the *target* position while the shutter is still physically moving.
                     // in_flight is only cleared by STOP or by a new move command.
@@ -527,6 +527,14 @@ async fn mqtt_task(
                             if let Ok(mut states) = actuator_states_writer.lock() {
                                 let state = states.entry(node_id).or_insert_with(commands::ActuatorState::new);
                                 state.ha_position = *pos;
+                            }
+                        }
+                    }
+                    if let Some(node_id) = id.strip_prefix("actuator_orientation_").and_then(|s| s.parse::<u16>().ok()) {
+                        if let StatValue::Float(orient) = &value {
+                            if let Ok(mut states) = actuator_states_writer.lock() {
+                                let state = states.entry(node_id).or_insert_with(commands::ActuatorState::new);
+                                state.ha_orientation = *orient;
                             }
                         }
                     }

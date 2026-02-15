@@ -89,6 +89,8 @@ pub enum ParseResult {
 pub struct ActuatorState {
     /// Last known HA position (0=closed, 100=open) from device reports.
     pub ha_position: f32,
+    /// Last known HA orientation/tilt (0=shade, 100=light) from device reports.
+    pub ha_orientation: f32,
     /// Travel time in seconds for fully opening (0→100 in HA).
     pub travel_time_open: f32,
     /// Travel time in seconds for fully closing (100→0 in HA).
@@ -101,6 +103,7 @@ impl ActuatorState {
     pub fn new() -> Self {
         Self {
             ha_position: 0.0,
+            ha_orientation: 0.0,
             travel_time_open: 30.0,
             travel_time_close: 30.0,
             in_flight: None,
@@ -262,19 +265,21 @@ pub fn parse_mqtt_command(
                     "STOP" => {
                         // Estimate current position from elapsed time and travel time,
                         // then send that position to freeze the blind in place.
-                        let estimated_ha = if let Ok(mut states) = actuator_states.lock() {
+                        // Device requires both position and orientation together.
+                        let (estimated_ha, es_orient) = if let Ok(mut states) = actuator_states.lock() {
                             let state = states.entry(node_id).or_insert_with(ActuatorState::new);
                             let pos = state.estimate_position();
+                            let orient = ((100.0 - state.ha_orientation.clamp(0.0, 100.0)) / 100.0 * 1024.0).round() as i32;
                             state.in_flight = None; // Clear in-flight
-                            pos
+                            (pos, orient)
                         } else {
-                            50.0 // Fallback to mid-position
+                            (50.0, 512) // Fallback to mid-position
                         };
                         let es_pos = ((100.0 - estimated_ha.clamp(0.0, 100.0)) / 100.0 * 1024.0).round() as i32;
-                        log::info!("STOP actuator {}: estimated HA pos {:.1}%, eSmart pos {}", node_id, estimated_ha, es_pos);
+                        log::info!("STOP actuator {}: estimated HA pos {:.1}%, eSmart pos {}, orientation {}", node_id, estimated_ha, es_pos, es_orient);
                         return ParseResult::Command(ESmartCommand {
-                            xmpp_payload: set_node(jid, node_id, json!({"position": es_pos})),
-                            description: format!("Stop actuator {} (estimated HA {:.0}% → eSmart {})", node_id, estimated_ha, es_pos),
+                            xmpp_payload: set_node(jid, node_id, json!({"position": es_pos, "orientation": es_orient})),
+                            description: format!("Stop actuator {} (estimated HA {:.0}% → eSmart pos {} orient {})", node_id, estimated_ha, es_pos, es_orient),
                         });
                     }
                     _ => {
@@ -302,6 +307,10 @@ pub fn parse_mqtt_command(
         // Conversion: esmart = round((100 - ha) / 100 * 1024)
         if let Some(id_str) = rest.strip_suffix("_tilt") {
             if let Ok(node_id) = id_str.parse::<u16>() {
+                // HA sends STOP to tilt topic too; ignore it (position STOP handles stopping)
+                if payload.trim().eq_ignore_ascii_case("STOP") {
+                    return ParseResult::Handled;
+                }
                 if let Ok(ha_tilt) = payload.trim().parse::<f32>() {
                     let ha_clamped = ha_tilt.clamp(0.0, 100.0);
                     let es_orient = ((100.0 - ha_clamped) / 100.0 * 1024.0).round() as i32;
