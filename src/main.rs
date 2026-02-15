@@ -308,7 +308,7 @@ async fn send_cover_discovery(
     let id = format!("actuator_{node_id}");
     let config_topic = format!("homeassistant/cover/esmart/{id}/config");
     // Position is already scaled to 0-100 and direction-inverted in data.rs.
-    // No tilt — eSmart requires position+orientation together, so we control both via position.
+    // Tilt (orientation) is also scaled to 0-100 and inverted in data.rs.
     // device_class "shutter" gives the open/stop/close buttons UI in HA.
     let config = json!({
         "name": format!("Actuator {node_id}"),
@@ -323,7 +323,12 @@ async fn send_cover_discovery(
         "position_closed": 0,
         "payload_open": "OPEN",
         "payload_close": "CLOSE",
-        "payload_stop": "STOP"
+        "payload_stop": "STOP",
+        "tilt_status_topic": format!("esmart/actuator_orientation_{node_id}/state"),
+        "tilt_status_template": "{{ value_json.orientation | int }}",
+        "tilt_command_topic": format!("esmart/actuator_{node_id}_tilt/set"),
+        "tilt_opened_value": 100,
+        "tilt_closed_value": 0
     });
     log::debug!("Sending cover discovery to '{}': {}", config_topic, config);
     client

@@ -273,7 +273,7 @@ pub fn parse_mqtt_command(
                         let es_pos = ((100.0 - estimated_ha.clamp(0.0, 100.0)) / 100.0 * 1024.0).round() as i32;
                         log::info!("STOP actuator {}: estimated HA pos {:.1}%, eSmart pos {}", node_id, estimated_ha, es_pos);
                         return ParseResult::Command(ESmartCommand {
-                            xmpp_payload: set_node(jid, node_id, json!({"position": es_pos, "orientation": es_pos})),
+                            xmpp_payload: set_node(jid, node_id, json!({"position": es_pos})),
                             description: format!("Stop actuator {} (estimated HA {:.0}% → eSmart {})", node_id, estimated_ha, es_pos),
                         });
                     }
@@ -296,7 +296,22 @@ pub fn parse_mqtt_command(
                 }
             }
         }
-        // Tilt removed — eSmart requires position+orientation together, both controlled via position.
+        // Tilt command: actuator_<id>_tilt
+        // HA tilt: 0=closed (shade), 100=open (light)
+        // eSmart orientation: 0=light passing, 1024=complete shade
+        // Conversion: esmart = round((100 - ha) / 100 * 1024)
+        if let Some(id_str) = rest.strip_suffix("_tilt") {
+            if let Ok(node_id) = id_str.parse::<u16>() {
+                if let Ok(ha_tilt) = payload.trim().parse::<f32>() {
+                    let ha_clamped = ha_tilt.clamp(0.0, 100.0);
+                    let es_orient = ((100.0 - ha_clamped) / 100.0 * 1024.0).round() as i32;
+                    return ParseResult::Command(ESmartCommand {
+                        xmpp_payload: set_node(jid, node_id, json!({"orientation": es_orient})),
+                        description: format!("Set actuator {} tilt to eSmart orientation {}", node_id, es_orient),
+                    });
+                }
+            }
+        }
     }
 
     // Fan commands: fan_<id>_speed, fan_<id>_mode, fan_<id>_onoff
@@ -313,7 +328,7 @@ pub fn parse_mqtt_command(
                     return ParseResult::Unrecognized;
                 };
                 return ParseResult::Command(ESmartCommand {
-                    xmpp_payload: set_node(jid, node_id, json!({"speed": speed})),
+                    xmpp_payload: set_node(jid, node_id, json!({"speed": speed, "mode": "manual"})),
                     description: format!("Set fan {} speed to {}", node_id, speed),
                 });
             }
@@ -335,7 +350,7 @@ pub fn parse_mqtt_command(
                 // Turn fan on/off by setting speed; ON defaults to 50% since we don't track previous speed
                 let speed = if on { "50%" } else { "0%" };
                 return ParseResult::Command(ESmartCommand {
-                    xmpp_payload: set_node(jid, node_id, json!({"speed": speed})),
+                    xmpp_payload: set_node(jid, node_id, json!({"speed": speed, "mode": "manual"})),
                     description: format!(
                         "Set fan {} to {} (speed {})",
                         node_id,
