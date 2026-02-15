@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{atomic::AtomicU64, Arc},
+    sync::{atomic::AtomicU64, Arc, Mutex},
     time::Duration,
 };
 
@@ -293,9 +293,9 @@ async fn send_climate_discovery(
         "temperature_state_template": "{{ value_json.setpoint }}",
         "current_temperature_topic": format!("esmart/room_temperature_{node_id}/state"),
         "current_temperature_template": "{{ value_json.temperature }}",
-        "min_temp": 5,
-        "max_temp": 30,
-        "temp_step": 0.5,
+        "min_temp": 18,
+        "max_temp": 24,
+        "temp_step": 1,
         "temperature_unit": "C"
     });
     log::debug!("Sending climate discovery to '{}': {}", config_topic, config);
@@ -404,6 +404,10 @@ async fn mqtt_task(
     // Track which control entities we've already sent discovery for
     let mut control_discovery_sent: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Track last known actuator positions (HA 0-100 scale) for STOP commands
+    let actuator_positions: Arc<Mutex<HashMap<u16, f32>>> = Arc::new(Mutex::new(HashMap::new()));
+    let actuator_positions_writer = actuator_positions.clone();
+
     // spawn a task to handle incoming messages from the XMPP client
     let mut client_clone = client.clone();
     let receiver_handle = tokio::spawn(async move {
@@ -411,6 +415,15 @@ async fn mqtt_task(
             match receiver.recv().await {
                 Ok((id, stat, value)) => {
                     log::debug!("Processing update for {id}");
+
+                    // Track actuator positions (HA 0-100 scale) for STOP commands
+                    if let Some(node_id) = id.strip_prefix("actuator_position_").and_then(|s| s.parse::<u16>().ok()) {
+                        if let StatValue::Float(pos) = &value {
+                            if let Ok(mut positions) = actuator_positions_writer.lock() {
+                                positions.insert(node_id, *pos);
+                            }
+                        }
+                    }
 
                     // Send control entity discovery on first sight of controllable nodes
                     if !control_discovery_sent.contains(&id) {
@@ -463,22 +476,9 @@ async fn mqtt_task(
 
                     if send_message {
                         let queue = cache_queues.get_mut(&id).expect("cache queue missing after insert");
-                        let resolved = if !queue.is_empty() {
-                            match &queue[0] {
-                                StatValue::Float(_) => {
-                                    let sum: f32 = queue.iter().map(|v| match v {
-                                        StatValue::Float(f) => *f,
-                                        _ => 0.0,
-                                    }).sum();
-                                    StatValue::Float(sum / queue.len() as f32)
-                                }
-                                StatValue::Text(_) => {
-                                    queue.last().cloned().unwrap_or(StatValue::Text(String::new()))
-                                }
-                            }
-                        } else {
-                            value_clone
-                        };
+                        // Always use the latest value — averaging causes ghost values
+                        // for control states (setpoint, deviceOnOff, position).
+                        let resolved = queue.last().cloned().unwrap_or(value_clone);
 
                         queue.clear();
                         let _ = last_contact.insert(id.clone(), Utc::now());
@@ -524,7 +524,8 @@ async fn mqtt_task(
                     }
                 };
                 log::info!("Received MQTT command: topic={} payload={}", topic, payload);
-                match commands::parse_mqtt_command(&jid, &topic, &payload) {
+                let cmd = commands::parse_mqtt_command(&jid, &topic, &payload, &actuator_positions);
+                match cmd {
                     Some(cmd) => {
                         if let Err(e) = cmd_sender.send(cmd).await {
                             log::error!("Failed to send command to XMPP task: {:?}", e);
