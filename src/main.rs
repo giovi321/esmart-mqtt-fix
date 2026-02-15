@@ -17,7 +17,7 @@ use tokio::sync::{
 use tokio_stream::StreamExt;
 use tokio_xmpp::{Client, Error, Event};
 use xmpp_parsers::{
-    message::{Body as MessageBody, Message, MessageType},
+    message::{Message, MessageType},
     muc::Muc,
     presence::{Presence, Show as PresenceShow, Type as PresenceType},
 };
@@ -193,8 +193,8 @@ async fn xmpp_task(
                 let mut message = Message::new(Some(args.xmpp_room.clone().into()));
                 message.type_ = MessageType::Groupchat;
                 message.bodies.insert(
-                    String::new(),
-                    MessageBody(cmd.xmpp_payload.clone()),
+                    xmpp_parsers::message::Lang(String::new()),
+                    cmd.xmpp_payload.clone(),
                 );
                 if let Err(e) = client.send_stanza(message.into()).await {
                     log::error!("Failed to send XMPP command: {:?}", e);
@@ -470,7 +470,7 @@ async fn mqtt_task(
     });
 
     // Main MQTT event loop: handle notifications including incoming Publish (commands from HA)
-    let mut cmd_client = client.clone();
+    let cmd_client = client.clone();
     loop {
         match event_loop.poll().await {
             Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_))) => {
