@@ -97,6 +97,9 @@ pub struct ActuatorState {
     pub travel_time_close: f32,
     /// In-flight move info: (start_instant, start_ha_pos, target_ha_pos).
     pub in_flight: Option<(Instant, f32, f32)>,
+    /// Estimated HA position from the last STOP command, used to handle
+    /// HA sending STOP to both position and tilt topics (double STOP).
+    pub last_stop_position: Option<f32>,
 }
 
 impl ActuatorState {
@@ -107,6 +110,7 @@ impl ActuatorState {
             travel_time_open: 30.0,
             travel_time_close: 30.0,
             in_flight: None,
+            last_stop_position: None,
         }
     }
 
@@ -243,6 +247,7 @@ pub fn parse_mqtt_command(
                         if let Ok(mut states) = actuator_states.lock() {
                             let state = states.entry(node_id).or_insert_with(ActuatorState::new);
                             state.in_flight = Some((Instant::now(), state.ha_position, 100.0));
+                            state.last_stop_position = None;
                         }
                         // eSmart 0 = fully open
                         return ParseResult::Command(ESmartCommand {
@@ -255,6 +260,7 @@ pub fn parse_mqtt_command(
                         if let Ok(mut states) = actuator_states.lock() {
                             let state = states.entry(node_id).or_insert_with(ActuatorState::new);
                             state.in_flight = Some((Instant::now(), state.ha_position, 0.0));
+                            state.last_stop_position = None;
                         }
                         // eSmart 1024 = fully closed
                         return ParseResult::Command(ESmartCommand {
@@ -270,7 +276,8 @@ pub fn parse_mqtt_command(
                             let state = states.entry(node_id).or_insert_with(ActuatorState::new);
                             let pos = state.estimate_position();
                             let orient = ((100.0 - state.ha_orientation.clamp(0.0, 100.0)) / 100.0 * 1024.0).round() as i32;
-                            state.in_flight = None; // Clear in-flight
+                            state.in_flight = None;
+                            state.last_stop_position = Some(pos);
                             (pos, orient)
                         } else {
                             (50.0, 512) // Fallback to mid-position
@@ -289,6 +296,7 @@ pub fn parse_mqtt_command(
                             if let Ok(mut states) = actuator_states.lock() {
                                 let state = states.entry(node_id).or_insert_with(ActuatorState::new);
                                 state.in_flight = Some((Instant::now(), state.ha_position, ha_clamped));
+                                state.last_stop_position = None;
                             }
                             // Invert and scale: HA 100=open → eSmart 0=open
                             let es_pos = ((100.0 - ha_clamped) / 100.0 * 1024.0).round() as i32;
@@ -312,9 +320,18 @@ pub fn parse_mqtt_command(
                 if payload.trim().eq_ignore_ascii_case("STOP") {
                     let (estimated_ha, es_orient) = if let Ok(mut states) = actuator_states.lock() {
                         let state = states.entry(node_id).or_insert_with(ActuatorState::new);
-                        let pos = state.estimate_position();
+                        // If position STOP already fired and cleared in_flight,
+                        // reuse its estimate instead of falling back to ha_position (target).
+                        let pos = if state.in_flight.is_some() {
+                            state.estimate_position()
+                        } else if let Some(last) = state.last_stop_position {
+                            last
+                        } else {
+                            state.ha_position
+                        };
                         let orient = ((100.0 - state.ha_orientation.clamp(0.0, 100.0)) / 100.0 * 1024.0).round() as i32;
                         state.in_flight = None;
+                        state.last_stop_position = Some(pos);
                         (pos, orient)
                     } else {
                         (50.0, 512)
