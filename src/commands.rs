@@ -128,31 +128,7 @@ pub fn parse_mqtt_command(jid: &str, topic: &str, payload: &str) -> Option<ESmar
                 }
             }
         }
-        if let Some(id_str) = rest.strip_suffix("_mode") {
-            if let Ok(node_id) = id_str.parse::<u16>() {
-                let mode = payload.trim().to_lowercase();
-                // eSmart doesn't accept direct onoff commands for rooms.
-                // The device auto-manages on/off based on setpoint vs temperature.
-                // "off" → set setpoint to minimum (5°C) to effectively disable heating.
-                // "heat" → set setpoint to a reasonable default (21°C) to enable heating.
-                let (setpoint, desc) = match mode.as_str() {
-                    "heat" | "on" => (21.0, "on (setpoint 21°C)"),
-                    "off" => (5.0, "off (setpoint 5°C)"),
-                    _ => return None,
-                };
-                return Some(ESmartCommand {
-                    xmpp_payload: set_node(
-                        jid,
-                        node_id,
-                        json!({"setpoint": setpoint}),
-                    ),
-                    description: format!(
-                        "Set room {} heating to {}",
-                        node_id, desc
-                    ),
-                });
-            }
-        }
+        // Mode is read-only in HA (no mode_command_topic); device auto-manages on/off.
     }
 
     // Actuator cover commands: actuator_<id>_position, actuator_<id>_tilt
@@ -196,44 +172,7 @@ pub fn parse_mqtt_command(jid: &str, topic: &str, payload: &str) -> Option<ESmar
                 }
             }
         }
-        if let Some(id_str) = rest.strip_suffix("_tilt") {
-            if let Ok(node_id) = id_str.parse::<u16>() {
-                let trimmed = payload.trim();
-                match trimmed.to_uppercase().as_str() {
-                    "OPEN" => {
-                        return Some(ESmartCommand {
-                            xmpp_payload: set_node(jid, node_id, json!({"orientation": 0})),
-                            description: format!("Open actuator {} tilt (eSmart orientation 0)", node_id),
-                        });
-                    }
-                    "CLOSE" => {
-                        return Some(ESmartCommand {
-                            xmpp_payload: set_node(jid, node_id, json!({"orientation": 1024})),
-                            description: format!("Close actuator {} tilt (eSmart orientation 1024)", node_id),
-                        });
-                    }
-                    "STOP" => {
-                        return Some(ESmartCommand {
-                            xmpp_payload: blind_operation(jid, node_id, "stop"),
-                            description: format!("Stop actuator {} tilt", node_id),
-                        });
-                    }
-                    _ => {
-                        if let Ok(ha_tilt) = trimmed.parse::<f32>() {
-                            // Invert and scale: HA 100=open → eSmart 0=open
-                            let es_tilt = ((100.0 - ha_tilt.clamp(0.0, 100.0)) / 100.0 * 1024.0).round() as i32;
-                            return Some(ESmartCommand {
-                                xmpp_payload: set_node(jid, node_id, json!({"orientation": es_tilt})),
-                                description: format!(
-                                    "Set actuator {} orientation to eSmart {}",
-                                    node_id, es_tilt
-                                ),
-                            });
-                        }
-                    }
-                }
-            }
-        }
+        // Tilt removed — eSmart requires position+orientation together, both controlled via position.
     }
 
     // Fan commands: fan_<id>_speed, fan_<id>_mode, fan_<id>_onoff

@@ -242,7 +242,9 @@ async fn send_cover_discovery(
 ) -> Result<(), ClientError> {
     let id = format!("actuator_{node_id}");
     let config_topic = format!("homeassistant/cover/esmart/{id}/config");
-    // Position/orientation are already scaled to 0-100 and direction-inverted in data.rs
+    // Position is already scaled to 0-100 and direction-inverted in data.rs.
+    // No tilt — eSmart requires position+orientation together, so we control both via position.
+    // device_class "shutter" gives the open/stop/close buttons UI in HA.
     let config = json!({
         "name": format!("Actuator {node_id}"),
         "unique_id": format!("esmart_actuator_{node_id}"),
@@ -251,15 +253,16 @@ async fn send_cover_discovery(
             "model": "eSmarter Client",
             "identifiers": [format!("esmart_actuator_{node_id}")]
         },
-        "icon": "mdi:window-shutter",
+        "device_class": "shutter",
+        "command_topic": format!("esmart/actuator_{node_id}_position/set"),
         "position_topic": format!("esmart/actuator_position_{node_id}/state"),
         "position_template": "{{ value_json.position | int }}",
         "set_position_topic": format!("esmart/actuator_{node_id}_position/set"),
-        "tilt_status_topic": format!("esmart/actuator_orientation_{node_id}/state"),
-        "tilt_status_template": "{{ value_json.orientation | int }}",
-        "tilt_command_topic": format!("esmart/actuator_{node_id}_tilt/set"),
         "position_open": 100,
-        "position_closed": 0
+        "position_closed": 0,
+        "payload_open": "OPEN",
+        "payload_close": "CLOSE",
+        "payload_stop": "STOP"
     });
     log::debug!("Sending cover discovery to '{}': {}", config_topic, config);
     client
@@ -283,7 +286,6 @@ async fn send_climate_discovery(
         },
         "icon": "mdi:radiator",
         "modes": ["off", "heat"],
-        "mode_command_topic": format!("esmart/room_{node_id}_mode/set"),
         "mode_state_template": "{% if value_json.deviceOnOff == 1.0 %}heat{% else %}off{% endif %}",
         "mode_state_topic": format!("esmart/room_heating_on_{node_id}/state"),
         "temperature_command_topic": format!("esmart/room_{node_id}_setpoint/set"),
