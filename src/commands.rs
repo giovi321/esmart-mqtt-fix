@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
 use chrono::Utc;
 use serde_json::{json, Value};
 
@@ -79,7 +76,6 @@ pub fn parse_mqtt_command(
     jid: &str,
     topic: &str,
     payload: &str,
-    actuator_positions: &Arc<Mutex<HashMap<u16, f32>>>,
 ) -> Option<ESmartCommand> {
     let parts: Vec<&str> = topic.split('/').collect();
     // Expected: ["esmart", "<entity_id>", "set"]
@@ -154,17 +150,15 @@ pub fn parse_mqtt_command(
                         });
                     }
                     "STOP" => {
-                        // Re-send current position to freeze the blind in place.
-                        // blind_operation "stop" is rejected by the device.
-                        let ha_pos = actuator_positions
-                            .lock()
-                            .ok()
-                            .and_then(|p| p.get(&node_id).copied())
-                            .unwrap_or(0.0);
-                        let es_pos = ((100.0 - ha_pos.clamp(0.0, 100.0)) / 100.0 * 1024.0).round() as i32;
+                        // Send a blind_operation stop command to halt the blind mid-travel.
+                        let body = json!({
+                            "id": node_id,
+                            "type": "blind_operation",
+                            "action": "stop"
+                        });
                         return Some(ESmartCommand {
-                            xmpp_payload: set_node(jid, node_id, json!({"position": es_pos, "orientation": es_pos})),
-                            description: format!("Stop actuator {} (re-send eSmart position {})", node_id, es_pos),
+                            xmpp_payload: make_message(jid, "operation", body),
+                            description: format!("Stop actuator {} (blind_operation stop)", node_id),
                         });
                     }
                     _ => {

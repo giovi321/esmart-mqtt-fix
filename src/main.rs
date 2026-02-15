@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{atomic::AtomicU64, Arc, Mutex},
+    sync::{atomic::AtomicU64, Arc},
     time::Duration,
 };
 
@@ -404,10 +404,6 @@ async fn mqtt_task(
     // Track which control entities we've already sent discovery for
     let mut control_discovery_sent: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // Track last known actuator positions (HA 0-100 scale) for STOP commands
-    let actuator_positions: Arc<Mutex<HashMap<u16, f32>>> = Arc::new(Mutex::new(HashMap::new()));
-    let actuator_positions_writer = actuator_positions.clone();
-
     // spawn a task to handle incoming messages from the XMPP client
     let mut client_clone = client.clone();
     let receiver_handle = tokio::spawn(async move {
@@ -415,15 +411,6 @@ async fn mqtt_task(
             match receiver.recv().await {
                 Ok((id, stat, value)) => {
                     log::debug!("Processing update for {id}");
-
-                    // Track actuator positions (HA 0-100 scale) for STOP commands
-                    if let Some(node_id) = id.strip_prefix("actuator_position_").and_then(|s| s.parse::<u16>().ok()) {
-                        if let StatValue::Float(pos) = &value {
-                            if let Ok(mut positions) = actuator_positions_writer.lock() {
-                                positions.insert(node_id, *pos);
-                            }
-                        }
-                    }
 
                     // Send control entity discovery on first sight of controllable nodes
                     if !control_discovery_sent.contains(&id) {
@@ -524,7 +511,7 @@ async fn mqtt_task(
                     }
                 };
                 log::info!("Received MQTT command: topic={} payload={}", topic, payload);
-                let cmd = commands::parse_mqtt_command(&jid, &topic, &payload, &actuator_positions);
+                let cmd = commands::parse_mqtt_command(&jid, &topic, &payload);
                 match cmd {
                     Some(cmd) => {
                         if let Err(e) = cmd_sender.send(cmd).await {
