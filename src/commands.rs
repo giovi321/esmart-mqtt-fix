@@ -3,22 +3,24 @@ use serde_json::{json, Value};
 
 const VERSION: &str = "1.19.0";
 
-fn make_headers(jid: &str, body_size: usize) -> Value {
-    let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%z").to_string();
+/// Build headers for a CMD message (matching the real eSmart app protocol).
+/// `msg_type` is "operation" for node commands, "tablet_operation" for holiday/freecooling.
+fn make_headers(jid: &str, msg_type: &str, body_size: usize) -> Value {
+    let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%SZ").to_string();
     json!({
         "from": jid,
         "to": "master",
         "timestamp": timestamp,
-        "method": "SET",
-        "type": "data",
+        "method": "CMD",
+        "type": msg_type,
         "version": VERSION,
         "size": body_size
     })
 }
 
-fn make_message(jid: &str, body: Value) -> String {
+fn make_message(jid: &str, msg_type: &str, body: Value) -> String {
     let body_str = body.to_string();
-    let headers = make_headers(jid, body_str.len());
+    let headers = make_headers(jid, msg_type, body_str.len());
     let msg = json!({
         "headers": headers,
         "body": body
@@ -26,36 +28,48 @@ fn make_message(jid: &str, body: Value) -> String {
     msg.to_string()
 }
 
-/// Build a SET command for a node (room, actuator, fan).
-/// `fields` is a JSON object with the fields to set, e.g. {"setpoint": 21.0}
+/// Build a CMD/operation for a node (room, actuator, fan).
+/// Body is a flat object: {"id": N, "field": value, ...}
 pub fn set_node(jid: &str, node_id: u16, fields: Value) -> String {
-    let body = json!({
-        "nodes": [{
-            "id": node_id,
-            "data": fields
-        }]
-    });
-    make_message(jid, body)
+    let mut body = json!({ "id": node_id });
+    if let Value::Object(map) = fields {
+        if let Value::Object(ref mut body_map) = body {
+            for (k, v) in map {
+                body_map.insert(k, v);
+            }
+        }
+    }
+    make_message(jid, "operation", body)
 }
 
-/// Build a SET command for holiday mode on/off.
+/// Build a CMD/operation for a blind stop/step command.
+/// Body: {"id": N, "blind_operation": "stop"/"step_up"/"step_down"}
+pub fn blind_operation(jid: &str, node_id: u16, operation: &str) -> String {
+    let body = json!({
+        "id": node_id,
+        "blind_operation": operation
+    });
+    make_message(jid, "operation", body)
+}
+
+/// Build a CMD/tablet_operation for holiday mode on/off.
+/// Body: {"type": "holiday_mode", "onoff": "on"/"off"}
 pub fn set_holiday_mode(jid: &str, on: bool) -> String {
     let body = json!({
-        "holiday_mode": {
-            "onoff": if on { "on" } else { "off" }
-        }
+        "type": "holiday_mode",
+        "onoff": if on { "on" } else { "off" }
     });
-    make_message(jid, body)
+    make_message(jid, "tablet_operation", body)
 }
 
-/// Build a SET command for freecooling on/off.
+/// Build a CMD/tablet_operation for freecooling on/off.
+/// Body: {"type": "regulated_freecooling", "onoff": "on"/"off"}
 pub fn set_freecooling(jid: &str, on: bool) -> String {
     let body = json!({
-        "freecooling": {
-            "onoff": if on { "on" } else { "off" }
-        }
+        "type": "regulated_freecooling",
+        "onoff": if on { "on" } else { "off" }
     });
-    make_message(jid, body)
+    make_message(jid, "tablet_operation", body)
 }
 
 /// Represents a command to send to the eSmart device via XMPP.
@@ -98,7 +112,15 @@ pub fn parse_mqtt_command(jid: &str, topic: &str, payload: &str) -> Option<ESmar
     if let Some(rest) = entity_id.strip_prefix("room_") {
         if let Some(id_str) = rest.strip_suffix("_setpoint") {
             if let Ok(node_id) = id_str.parse::<u16>() {
-                if let Ok(temp) = payload.trim().parse::<f32>() {
+                let trimmed = payload.trim();
+                // The real app sends "MAX" for the maximum setpoint
+                if trimmed.eq_ignore_ascii_case("MAX") {
+                    return Some(ESmartCommand {
+                        xmpp_payload: set_node(jid, node_id, json!({"setpoint": "MAX"})),
+                        description: format!("Set room {} setpoint to MAX", node_id),
+                    });
+                }
+                if let Ok(temp) = trimmed.parse::<f32>() {
                     return Some(ESmartCommand {
                         xmpp_payload: set_node(jid, node_id, json!({"setpoint": temp})),
                         description: format!("Set room {} setpoint to {}°C", node_id, temp),
@@ -118,7 +140,7 @@ pub fn parse_mqtt_command(jid: &str, topic: &str, payload: &str) -> Option<ESmar
                     xmpp_payload: set_node(
                         jid,
                         node_id,
-                        json!({"deviceOnOff": if on { "on" } else { "off" }}),
+                        json!({"onoff": if on { "on" } else { "off" }}),
                     ),
                     description: format!(
                         "Set room {} heating to {}",
@@ -131,29 +153,78 @@ pub fn parse_mqtt_command(jid: &str, topic: &str, payload: &str) -> Option<ESmar
     }
 
     // Actuator cover commands: actuator_<id>_position, actuator_<id>_tilt
+    // Real app uses 0-1024 range; HA cover uses 0-100. We scale accordingly.
     if let Some(rest) = entity_id.strip_prefix("actuator_") {
         if let Some(id_str) = rest.strip_suffix("_position") {
             if let Ok(node_id) = id_str.parse::<u16>() {
-                if let Ok(pos) = payload.trim().parse::<f32>() {
-                    let pos = pos.clamp(0.0, 100.0);
-                    return Some(ESmartCommand {
-                        xmpp_payload: set_node(jid, node_id, json!({"position": pos})),
-                        description: format!("Set actuator {} position to {}%", node_id, pos),
-                    });
+                let trimmed = payload.trim();
+                match trimmed.to_uppercase().as_str() {
+                    "OPEN" => {
+                        return Some(ESmartCommand {
+                            xmpp_payload: set_node(jid, node_id, json!({"position": 1024, "orientation": 1024})),
+                            description: format!("Open actuator {} (position 1024)", node_id),
+                        });
+                    }
+                    "CLOSE" => {
+                        return Some(ESmartCommand {
+                            xmpp_payload: set_node(jid, node_id, json!({"position": 0, "orientation": 0})),
+                            description: format!("Close actuator {} (position 0)", node_id),
+                        });
+                    }
+                    "STOP" => {
+                        return Some(ESmartCommand {
+                            xmpp_payload: blind_operation(jid, node_id, "stop"),
+                            description: format!("Stop actuator {}", node_id),
+                        });
+                    }
+                    _ => {
+                        if let Ok(pos) = trimmed.parse::<f32>() {
+                            // HA sends 0-100, scale to 0-1024
+                            let pos = ((pos.clamp(0.0, 100.0) / 100.0) * 1024.0).round() as i32;
+                            return Some(ESmartCommand {
+                                xmpp_payload: set_node(jid, node_id, json!({"position": pos, "orientation": pos})),
+                                description: format!("Set actuator {} position to {}", node_id, pos),
+                            });
+                        }
+                    }
                 }
             }
         }
         if let Some(id_str) = rest.strip_suffix("_tilt") {
             if let Ok(node_id) = id_str.parse::<u16>() {
-                if let Ok(tilt) = payload.trim().parse::<f32>() {
-                    let tilt = tilt.clamp(0.0, 100.0);
-                    return Some(ESmartCommand {
-                        xmpp_payload: set_node(jid, node_id, json!({"orientation": tilt})),
-                        description: format!(
-                            "Set actuator {} orientation to {}%",
-                            node_id, tilt
-                        ),
-                    });
+                let trimmed = payload.trim();
+                match trimmed.to_uppercase().as_str() {
+                    "OPEN" => {
+                        return Some(ESmartCommand {
+                            xmpp_payload: set_node(jid, node_id, json!({"orientation": 1024})),
+                            description: format!("Open actuator {} tilt (orientation 1024)", node_id),
+                        });
+                    }
+                    "CLOSE" => {
+                        return Some(ESmartCommand {
+                            xmpp_payload: set_node(jid, node_id, json!({"orientation": 0})),
+                            description: format!("Close actuator {} tilt (orientation 0)", node_id),
+                        });
+                    }
+                    "STOP" => {
+                        return Some(ESmartCommand {
+                            xmpp_payload: blind_operation(jid, node_id, "stop"),
+                            description: format!("Stop actuator {} tilt", node_id),
+                        });
+                    }
+                    _ => {
+                        if let Ok(tilt) = trimmed.parse::<f32>() {
+                            // HA sends 0-100, scale to 0-1024
+                            let tilt = ((tilt.clamp(0.0, 100.0) / 100.0) * 1024.0).round() as i32;
+                            return Some(ESmartCommand {
+                                xmpp_payload: set_node(jid, node_id, json!({"orientation": tilt})),
+                                description: format!(
+                                    "Set actuator {} orientation to {}",
+                                    node_id, tilt
+                                ),
+                            });
+                        }
+                    }
                 }
             }
         }
