@@ -365,6 +365,57 @@ async fn send_switch_discovery(
         .await
 }
 
+async fn send_number_discovery(
+    client: &mut AsyncClient,
+    entity_id: &str,
+    name: &str,
+    icon: &str,
+    min: f32,
+    max: f32,
+    step: f32,
+    unit: &str,
+    initial: f32,
+) -> Result<(), ClientError> {
+    let config_topic = format!("homeassistant/number/esmart/{entity_id}/config");
+    let config = json!({
+        "name": name,
+        "unique_id": format!("esmart_{entity_id}"),
+        "device": {
+            "name": format!("eSmart {name}"),
+            "model": "eSmarter Client",
+            "identifiers": [format!("esmart_{entity_id}")]
+        },
+        "icon": icon,
+        "command_topic": format!("esmart/{entity_id}/set"),
+        "state_topic": format!("esmart/{entity_id}/state"),
+        "min": min,
+        "max": max,
+        "step": step,
+        "unit_of_measurement": unit,
+        "mode": "box"
+    });
+    log::debug!("Sending number discovery to '{}': {}", config_topic, config);
+    client
+        .publish(
+            config_topic,
+            rumqttc::QoS::AtLeastOnce,
+            true,
+            config.to_string(),
+        )
+        .await?;
+    // Publish initial state so HA shows the default value
+    let state_topic = format!("esmart/{entity_id}/state");
+    client
+        .publish(
+            state_topic,
+            rumqttc::QoS::AtLeastOnce,
+            true,
+            initial.to_string(),
+        )
+        .await?;
+    Ok(())
+}
+
 // task which fetches the stats from the queue and sends them to MQTT
 async fn mqtt_task(
     mut receiver: Receiver<ChannelMessage>,
@@ -404,6 +455,11 @@ async fn mqtt_task(
     // Track which control entities we've already sent discovery for
     let mut control_discovery_sent: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Shared actuator state for STOP position estimation and travel time config
+    let actuator_states = commands::new_actuator_states();
+    let actuator_states_writer = actuator_states.clone();
+    let actuator_states_cmd = actuator_states.clone();
+
     // spawn a task to handle incoming messages from the XMPP client
     let mut client_clone = client.clone();
     let receiver_handle = tokio::spawn(async move {
@@ -411,6 +467,17 @@ async fn mqtt_task(
             match receiver.recv().await {
                 Ok((id, stat, value)) => {
                     log::debug!("Processing update for {id}");
+
+                    // Track actuator positions (HA 0-100 scale) for STOP estimation
+                    if let Some(node_id) = id.strip_prefix("actuator_position_").and_then(|s| s.parse::<u16>().ok()) {
+                        if let StatValue::Float(pos) = &value {
+                            if let Ok(mut states) = actuator_states_writer.lock() {
+                                let state = states.entry(node_id).or_insert_with(commands::ActuatorState::new);
+                                state.ha_position = *pos;
+                                state.in_flight = None; // Device reported position, move is done
+                            }
+                        }
+                    }
 
                     // Send control entity discovery on first sight of controllable nodes
                     if !control_discovery_sent.contains(&id) {
@@ -422,6 +489,25 @@ async fn mqtt_task(
                         } else if let Some(node_id) = id.strip_prefix("actuator_position_").and_then(|s| s.parse::<u16>().ok()) {
                             if let Err(e) = send_cover_discovery(&mut client_clone, node_id).await {
                                 log::error!("Error sending cover discovery: {:?}", e);
+                            }
+                            // Send Number entity discovery for travel time configuration
+                            if let Err(e) = send_number_discovery(
+                                &mut client_clone,
+                                &format!("actuator_{node_id}_travel_open"),
+                                &format!("Actuator {node_id} Open Travel Time"),
+                                "mdi:timer",
+                                1.0, 120.0, 1.0, "s", 30.0,
+                            ).await {
+                                log::error!("Error sending travel_open number discovery: {:?}", e);
+                            }
+                            if let Err(e) = send_number_discovery(
+                                &mut client_clone,
+                                &format!("actuator_{node_id}_travel_close"),
+                                &format!("Actuator {node_id} Close Travel Time"),
+                                "mdi:timer",
+                                1.0, 120.0, 1.0, "s", 30.0,
+                            ).await {
+                                log::error!("Error sending travel_close number discovery: {:?}", e);
                             }
                             control_discovery_sent.insert(id.clone());
                         } else if let Some(node_id) = id.strip_prefix("fan_power_").and_then(|s| s.parse::<u16>().ok()) {
@@ -511,14 +597,24 @@ async fn mqtt_task(
                     }
                 };
                 log::info!("Received MQTT command: topic={} payload={}", topic, payload);
-                let cmd = commands::parse_mqtt_command(&jid, &topic, &payload);
-                match cmd {
-                    Some(cmd) => {
+                match commands::parse_mqtt_command(&jid, &topic, &payload, &actuator_states_cmd) {
+                    commands::ParseResult::Command(cmd) => {
                         if let Err(e) = cmd_sender.send(cmd).await {
                             log::error!("Failed to send command to XMPP task: {:?}", e);
                         }
                     }
-                    None => {
+                    commands::ParseResult::Handled => {
+                        // Publish updated travel time state back to MQTT so HA reflects the value
+                        if let Err(e) = cmd_client.publish(
+                            topic.replace("/set", "/state"),
+                            rumqttc::QoS::AtLeastOnce,
+                            true,
+                            payload.trim().to_string(),
+                        ).await {
+                            log::error!("Failed to publish travel time state: {:?}", e);
+                        }
+                    }
+                    commands::ParseResult::Unrecognized => {
                         log::warn!("Could not parse command from topic={} payload={}", topic, payload);
                     }
                 }
