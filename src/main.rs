@@ -139,6 +139,7 @@ async fn send_mqtt_discovery(
     }
     if let Some(unit) = stat.unit_str() {
         map.insert("unit_of_measurement".into(), json!(unit));
+        map.insert("state_class".into(), json!("measurement"));
     }
     let json = serde_json::Value::Object(map);
 
