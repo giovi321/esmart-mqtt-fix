@@ -419,6 +419,34 @@ async fn send_switch_discovery(
         .await
 }
 
+async fn send_binary_sensor_discovery(
+    client: &mut AsyncClient,
+    entity_id: &str,
+    name: &str,
+    icon: &str,
+    state_property: &str,
+) -> Result<(), ClientError> {
+    let config_topic = format!("homeassistant/binary_sensor/esmart/{entity_id}/config");
+    let value_tpl = format!(
+        "{{% if value_json.{} == 1.0 %}}ON{{% else %}}OFF{{% endif %}}",
+        state_property
+    );
+    let config = json!({
+        "name": name,
+        "unique_id": format!("esmart_{entity_id}_binary"),
+        "device": device_for_entity(entity_id),
+        "icon": icon,
+        "state_topic": format!("esmart/{entity_id}/state"),
+        "value_template": value_tpl,
+        "payload_on": "ON",
+        "payload_off": "OFF"
+    });
+    log::debug!("Sending binary_sensor discovery to '{}': {}", config_topic, config);
+    client
+        .publish(config_topic, rumqttc::QoS::AtLeastOnce, true, config.to_string())
+        .await
+}
+
 async fn send_number_discovery(
     client: &mut AsyncClient,
     entity_id: &str,
@@ -579,10 +607,16 @@ async fn mqtt_task(
                             if let Err(e) = send_switch_discovery(&mut client_clone, "holiday_mode", "Holiday Mode", "mdi:beach", "holiday_mode").await {
                                 log::error!("Error sending holiday mode switch discovery: {:?}", e);
                             }
+                            if let Err(e) = send_binary_sensor_discovery(&mut client_clone, "holiday_mode", "Holiday Mode", "mdi:beach", "holiday_mode").await {
+                                log::error!("Error sending holiday mode binary_sensor discovery: {:?}", e);
+                            }
                             control_discovery_sent.insert(id.clone());
                         } else if id == "freecooling" {
                             if let Err(e) = send_switch_discovery(&mut client_clone, "freecooling", "Freecooling", "mdi:snowflake", "freecooling").await {
                                 log::error!("Error sending freecooling switch discovery: {:?}", e);
+                            }
+                            if let Err(e) = send_binary_sensor_discovery(&mut client_clone, "freecooling", "Freecooling", "mdi:snowflake", "freecooling").await {
+                                log::error!("Error sending freecooling binary_sensor discovery: {:?}", e);
                             }
                             control_discovery_sent.insert(id.clone());
                         }
@@ -592,9 +626,13 @@ async fn mqtt_task(
                     match cache_queues.get_mut(&id) {
                         Some(queue) => queue.push(value),
                         None => {
-                            if let Err(e) = send_mqtt_discovery(&mut client_clone, &id, &stat).await
-                            {
-                                log::error!("Error sending discovery message: {:?}", e);
+                            // Skip redundant numeric sensor for entities that have
+                            // switch + binary_sensor discovery
+                            if id != "freecooling" && id != "holiday_mode" {
+                                if let Err(e) = send_mqtt_discovery(&mut client_clone, &id, &stat).await
+                                {
+                                    log::error!("Error sending discovery message: {:?}", e);
+                                }
                             }
                             cache_queues.insert(id.clone(), vec![value]);
                         }
