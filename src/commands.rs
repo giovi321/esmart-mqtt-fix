@@ -71,6 +71,8 @@ pub fn set_freecooling(jid: &str, on: bool) -> String {
 pub struct ESmartCommand {
     pub xmpp_payload: String,
     pub description: String,
+    /// When the command was created, so stale ones can be dropped.
+    pub created: Instant,
 }
 
 /// Result of parsing an MQTT command.
@@ -78,10 +80,36 @@ pub struct ESmartCommand {
 pub enum ParseResult {
     /// An XMPP command to forward to the eSmart device.
     Command(ESmartCommand),
-    /// The command was handled locally (e.g. travel time config), no XMPP needed.
-    Handled,
+    /// A travel time was set locally (no XMPP needed); the caller persists it
+    /// and echoes it back to the state topic.
+    TravelTime { node_id: u16, dir: &'static str, secs: f32 },
     /// The topic/payload was not recognized.
     Unrecognized,
+}
+
+/// Fan speeds the eSmart accepts. Anything else is answered with
+/// "invalid values" (verified on a 3-speed ventilation unit).
+pub const FAN_SPEEDS: [&str; 4] = ["0%", "33%", "66%", "99%"];
+
+/// Map a 0-100 percentage to the closest accepted fan speed.
+pub fn snap_fan_speed(pct: f32) -> &'static str {
+    let pct = pct.clamp(0.0, 100.0);
+    if pct <= 0.0 {
+        FAN_SPEEDS[0]
+    } else if pct <= 33.0 {
+        FAN_SPEEDS[1]
+    } else if pct <= 66.0 {
+        FAN_SPEEDS[2]
+    } else {
+        FAN_SPEEDS[3]
+    }
+}
+
+/// Last non-zero speed reported per fan, so ON restores it.
+pub type FanStates = Arc<Mutex<HashMap<u16, String>>>;
+
+pub fn new_fan_states() -> FanStates {
+    Arc::new(Mutex::new(HashMap::new()))
 }
 
 /// Tracks the state of a single actuator for STOP position estimation.
@@ -155,6 +183,7 @@ pub fn parse_mqtt_command(
     topic: &str,
     payload: &str,
     actuator_states: &ActuatorStates,
+    fan_states: &FanStates,
 ) -> ParseResult {
     let parts: Vec<&str> = topic.split('/').collect();
     // Expected: ["esmart", "<entity_id>", "set"]
@@ -173,7 +202,7 @@ pub fn parse_mqtt_command(
                         states.entry(node_id).or_insert_with(ActuatorState::new).travel_time_open = secs;
                     }
                     log::info!("Set actuator {} open travel time to {}s", node_id, secs);
-                    return ParseResult::Handled;
+                    return ParseResult::TravelTime { node_id, dir: "open", secs };
                 }
             }
         }
@@ -185,16 +214,43 @@ pub fn parse_mqtt_command(
                         states.entry(node_id).or_insert_with(ActuatorState::new).travel_time_close = secs;
                     }
                     log::info!("Set actuator {} close travel time to {}s", node_id, secs);
-                    return ParseResult::Handled;
+                    return ParseResult::TravelTime { node_id, dir: "close", secs };
                 }
             }
         }
+    }
+
+    // Raw passthrough, for trying out eSmart features the bridge does not know yet.
+    // Payload is either a node body ({"id": 337, "speed": "33%"}), sent as an
+    // "operation", or {"type": "<header type>", "body": {...}}.
+    if entity_id == "raw_command" {
+        let value: Value = match serde_json::from_str(payload.trim()) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("raw_command payload is not valid JSON: {}", e);
+                return ParseResult::Unrecognized;
+            }
+        };
+        let (msg_type, body) = match (value.get("type").and_then(|t| t.as_str()), value.get("body")) {
+            (Some(t), Some(b)) => (t.to_string(), b.clone()),
+            _ => ("operation".to_string(), value),
+        };
+        if !body.is_object() {
+            log::warn!("raw_command body must be a JSON object");
+            return ParseResult::Unrecognized;
+        }
+        return ParseResult::Command(ESmartCommand {
+            created: Instant::now(),
+            xmpp_payload: make_message(jid, &msg_type, body.clone()),
+            description: format!("Raw {} command {}", msg_type, body),
+        });
     }
 
     // Holiday mode switch
     if entity_id == "holiday_mode" {
         let on = matches!(payload.trim().to_uppercase().as_str(), "ON" | "1" | "TRUE");
         return ParseResult::Command(ESmartCommand {
+            created: Instant::now(),
             xmpp_payload: set_holiday_mode(jid, on),
             description: format!("Set holiday mode to {}", if on { "on" } else { "off" }),
         });
@@ -204,6 +260,7 @@ pub fn parse_mqtt_command(
     if entity_id == "freecooling" {
         let on = matches!(payload.trim().to_uppercase().as_str(), "ON" | "1" | "TRUE");
         return ParseResult::Command(ESmartCommand {
+            created: Instant::now(),
             xmpp_payload: set_freecooling(jid, on),
             description: format!("Set freecooling to {}", if on { "on" } else { "off" }),
         });
@@ -217,6 +274,7 @@ pub fn parse_mqtt_command(
                 // The real app sends "MAX" for the maximum setpoint
                 if trimmed.eq_ignore_ascii_case("MAX") {
                     return ParseResult::Command(ESmartCommand {
+                        created: Instant::now(),
                         xmpp_payload: set_node(jid, node_id, json!({"setpoint": "MAX"})),
                         description: format!("Set room {} setpoint to MAX", node_id),
                     });
@@ -225,6 +283,7 @@ pub fn parse_mqtt_command(
                     // Device only accepts integer setpoints in range 18-24
                     let setpoint = temp.round().clamp(18.0, 24.0) as i32;
                     return ParseResult::Command(ESmartCommand {
+                        created: Instant::now(),
                         xmpp_payload: set_node(jid, node_id, json!({"setpoint": setpoint})),
                         description: format!("Set room {} setpoint to {}°C", node_id, setpoint),
                     });
@@ -251,6 +310,7 @@ pub fn parse_mqtt_command(
                         }
                         // eSmart 0 = fully open
                         return ParseResult::Command(ESmartCommand {
+                            created: Instant::now(),
                             xmpp_payload: set_node(jid, node_id, json!({"position": 0, "orientation": 0})),
                             description: format!("Open actuator {} (eSmart position 0)", node_id),
                         });
@@ -264,6 +324,7 @@ pub fn parse_mqtt_command(
                         }
                         // eSmart 1024 = fully closed
                         return ParseResult::Command(ESmartCommand {
+                            created: Instant::now(),
                             xmpp_payload: set_node(jid, node_id, json!({"position": 1024, "orientation": 1024})),
                             description: format!("Close actuator {} (eSmart position 1024)", node_id),
                         });
@@ -285,6 +346,7 @@ pub fn parse_mqtt_command(
                         let es_pos = ((100.0 - estimated_ha.clamp(0.0, 100.0)) / 100.0 * 1024.0).round() as i32;
                         log::info!("STOP actuator {}: estimated HA pos {:.1}%, eSmart pos {}, orientation {}", node_id, estimated_ha, es_pos, es_orient);
                         return ParseResult::Command(ESmartCommand {
+                            created: Instant::now(),
                             xmpp_payload: set_node(jid, node_id, json!({"position": es_pos, "orientation": es_orient})),
                             description: format!("Stop actuator {} (estimated HA {:.0}% → eSmart pos {} orient {})", node_id, estimated_ha, es_pos, es_orient),
                         });
@@ -301,6 +363,7 @@ pub fn parse_mqtt_command(
                             // Invert and scale: HA 100=open → eSmart 0=open
                             let es_pos = ((100.0 - ha_clamped) / 100.0 * 1024.0).round() as i32;
                             return ParseResult::Command(ESmartCommand {
+                                created: Instant::now(),
                                 xmpp_payload: set_node(jid, node_id, json!({"position": es_pos, "orientation": es_pos})),
                                 description: format!("Set actuator {} position to eSmart {}", node_id, es_pos),
                             });
@@ -339,6 +402,7 @@ pub fn parse_mqtt_command(
                     let es_pos = ((100.0 - estimated_ha.clamp(0.0, 100.0)) / 100.0 * 1024.0).round() as i32;
                     log::info!("STOP actuator {} (via tilt): estimated HA pos {:.1}%, eSmart pos {}, orientation {}", node_id, estimated_ha, es_pos, es_orient);
                     return ParseResult::Command(ESmartCommand {
+                        created: Instant::now(),
                         xmpp_payload: set_node(jid, node_id, json!({"position": es_pos, "orientation": es_orient})),
                         description: format!("Stop actuator {} via tilt (estimated HA {:.0}% → eSmart pos {} orient {})", node_id, estimated_ha, es_pos, es_orient),
                     });
@@ -357,6 +421,7 @@ pub fn parse_mqtt_command(
                         512
                     };
                     return ParseResult::Command(ESmartCommand {
+                        created: Instant::now(),
                         xmpp_payload: set_node(jid, node_id, json!({"position": es_pos, "orientation": es_orient})),
                         description: format!("Set actuator {} tilt to eSmart orientation {} (keeping pos {})", node_id, es_orient, es_pos),
                     });
@@ -365,23 +430,30 @@ pub fn parse_mqtt_command(
         }
     }
 
-    // Fan commands: fan_<id>_speed, fan_<id>_mode, fan_<id>_onoff
+    // Fan commands: fan_<id>_speed (0-100 %), fan_<id>_level (0-3), fan_<id>_mode, fan_<id>_onoff
     if let Some(rest) = entity_id.strip_prefix("fan_") {
+        let fan_cmd = |node_id: u16, speed: &str, why: String| {
+            ParseResult::Command(ESmartCommand {
+                created: Instant::now(),
+                xmpp_payload: set_node(jid, node_id, json!({"speed": speed, "mode": "manual"})),
+                description: format!("Set fan {} speed to {} ({})", node_id, speed, why),
+            })
+        };
         if let Some(id_str) = rest.strip_suffix("_speed") {
             if let Ok(node_id) = id_str.parse::<u16>() {
-                let speed_str = payload.trim();
-                // Accept "50", "50%" or raw percentage
-                let speed = if speed_str.ends_with('%') {
-                    speed_str.to_string()
-                } else if let Ok(pct) = speed_str.parse::<u8>() {
-                    format!("{}%", pct.min(100))
-                } else {
-                    return ParseResult::Unrecognized;
-                };
-                return ParseResult::Command(ESmartCommand {
-                    xmpp_payload: set_node(jid, node_id, json!({"speed": speed, "mode": "manual"})),
-                    description: format!("Set fan {} speed to {}", node_id, speed),
-                });
+                // Accept "50", "50%" or "50.0"; snap to a speed the device accepts
+                let raw = payload.trim().trim_end_matches('%');
+                if let Ok(pct) = raw.parse::<f32>() {
+                    return fan_cmd(node_id, snap_fan_speed(pct), format!("requested {}%", pct));
+                }
+            }
+        }
+        if let Some(id_str) = rest.strip_suffix("_level") {
+            if let Ok(node_id) = id_str.parse::<u16>() {
+                if let Ok(level) = payload.trim().parse::<f32>() {
+                    let idx = (level.round() as i64).clamp(0, 3) as usize;
+                    return fan_cmd(node_id, FAN_SPEEDS[idx], format!("level {}", idx));
+                }
             }
         }
         if let Some(id_str) = rest.strip_suffix("_mode") {
@@ -389,6 +461,7 @@ pub fn parse_mqtt_command(
                 let mode = payload.trim().to_lowercase();
                 if mode == "auto" || mode == "manual" {
                     return ParseResult::Command(ESmartCommand {
+                        created: Instant::now(),
                         xmpp_payload: set_node(jid, node_id, json!({"mode": mode})),
                         description: format!("Set fan {} mode to {}", node_id, mode),
                     });
@@ -398,21 +471,64 @@ pub fn parse_mqtt_command(
         if let Some(id_str) = rest.strip_suffix("_onoff") {
             if let Ok(node_id) = id_str.parse::<u16>() {
                 let on = matches!(payload.trim().to_uppercase().as_str(), "ON" | "1" | "TRUE");
-                // Turn fan on/off by setting speed; ON defaults to 50% since we don't track previous speed
-                let speed = if on { "50%" } else { "0%" };
-                return ParseResult::Command(ESmartCommand {
-                    xmpp_payload: set_node(jid, node_id, json!({"speed": speed, "mode": "manual"})),
-                    description: format!(
-                        "Set fan {} to {} (speed {})",
-                        node_id,
-                        if on { "on" } else { "off" },
-                        speed
-                    ),
-                });
+                // ON restores the last non-zero speed seen, else the lowest speed
+                let speed = if on {
+                    fan_states
+                        .lock()
+                        .ok()
+                        .and_then(|f| f.get(&node_id).cloned())
+                        .unwrap_or_else(|| FAN_SPEEDS[1].to_string())
+                } else {
+                    FAN_SPEEDS[0].to_string()
+                };
+                return fan_cmd(node_id, &speed, if on { "on".into() } else { "off".into() });
             }
         }
     }
 
     log::warn!("Unrecognized command topic: {} payload: {}", topic, payload);
     ParseResult::Unrecognized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body(r: ParseResult) -> Value {
+        match r {
+            ParseResult::Command(c) => serde_json::from_str::<Value>(&c.xmpp_payload).unwrap()["body"].clone(),
+            other => panic!("expected command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn fan_speed_snaps_to_accepted_values() {
+        assert_eq!(snap_fan_speed(0.0), "0%");
+        assert_eq!(snap_fan_speed(10.0), "33%");
+        assert_eq!(snap_fan_speed(50.0), "66%");
+        assert_eq!(snap_fan_speed(100.0), "99%");
+        let (a, f) = (new_actuator_states(), new_fan_states());
+        assert_eq!(body(parse_mqtt_command("j", "esmart/fan_337_speed/set", "100%", &a, &f))["speed"], "99%");
+        assert_eq!(body(parse_mqtt_command("j", "esmart/fan_337_level/set", "2", &a, &f))["speed"], "66%");
+    }
+
+    #[test]
+    fn fan_on_restores_last_speed() {
+        let (a, f) = (new_actuator_states(), new_fan_states());
+        assert_eq!(body(parse_mqtt_command("j", "esmart/fan_337_onoff/set", "ON", &a, &f))["speed"], "33%");
+        f.lock().unwrap().insert(337, "66%".into());
+        assert_eq!(body(parse_mqtt_command("j", "esmart/fan_337_onoff/set", "ON", &a, &f))["speed"], "66%");
+        assert_eq!(body(parse_mqtt_command("j", "esmart/fan_337_onoff/set", "OFF", &a, &f))["speed"], "0%");
+    }
+
+    #[test]
+    fn raw_command_passthrough() {
+        let (a, f) = (new_actuator_states(), new_fan_states());
+        let b = body(parse_mqtt_command("j", "esmart/raw_command/set", r#"{"id":5,"x":1}"#, &a, &f));
+        assert_eq!(b["id"], 5);
+        assert!(matches!(
+            parse_mqtt_command("j", "esmart/raw_command/set", "not json", &a, &f),
+            ParseResult::Unrecognized
+        ));
+    }
 }

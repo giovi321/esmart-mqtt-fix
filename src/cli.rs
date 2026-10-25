@@ -1,7 +1,6 @@
 use clap::Parser;
 use xmpp_parsers::jid::{BareJid, Jid};
 
-/// A fictional versioning CLI
 #[derive(Debug, Parser)] // requires `derive` feature
 #[command(name = "esmart_mqtt")]
 #[command(about = "eSmart - MQTT bridge", long_about = None)]
@@ -33,4 +32,18 @@ pub(crate) struct Cli {
     // XMPP Options
     #[arg(long, value_name = "NICKNAME", env, default_value = "esmart")]
     pub(crate) xmpp_nickname: String,
+    /// Reconnect to XMPP when no data message arrived for this many seconds.
+    /// eSmart normally sends one every second or two.
+    #[arg(long, value_name = "SECONDS", env, default_value_t = 120)]
+    pub(crate) xmpp_stale_secs: u64,
+
+    // Bridge options
+    /// JSON file holding energy/water totals and actuator travel times across
+    /// restarts. Without it, totals restart from zero on every restart.
+    #[arg(long, value_name = "PATH", env)]
+    pub(crate) state_file: Option<std::path::PathBuf>,
+    /// Drop commands that could not be delivered to eSmart within this many
+    /// seconds (e.g. while XMPP was reconnecting), instead of replaying them late.
+    #[arg(long, value_name = "SECONDS", env, default_value_t = 30)]
+    pub(crate) command_timeout_secs: u64,
 }
