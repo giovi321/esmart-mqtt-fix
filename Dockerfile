@@ -8,7 +8,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y wget
 
 RUN cd /app && \
-    wget https://github.com/pferreir/esmart-mqtt/releases/download/${VERSION}/esmart_mqtt-${ARCH}.tar.gz && \
+    wget https://github.com/giovi321/esmart-mqtt-fix/releases/download/${VERSION}/esmart_mqtt-${ARCH}.tar.gz && \
     tar zxvf esmart_mqtt-${ARCH}.tar.gz && \
     chmod +x esmart_mqtt && \
     rm *.tar.gz

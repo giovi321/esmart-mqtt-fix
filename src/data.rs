@@ -49,18 +49,13 @@ mod date_format {
     }
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, Default)]
 pub enum OnOff {
     #[serde(rename = "on")]
     On,
     #[serde(rename = "off")]
+    #[default]
     Off,
-}
-
-impl Default for OnOff {
-    fn default() -> Self {
-        OnOff::Off
-    }
 }
 
 impl From<&OnOff> for bool {
@@ -111,55 +106,108 @@ pub enum Meter {
     Flow {
         id: u16,
         name: String,
-        flow_rate: f32,
+        flow_rate: f64,
     },
     Power {
         id: u16,
         name: String,
-        power: f32,
+        power: f64,
     },
     Temperature {
         id: u16,
-        temperature: f32,
+        temperature: f64,
     },
+    /// Any meter shape not known yet. Kept so that one new meter type does not
+    /// make the whole message fail to deserialize.
+    Unknown(serde_json::Value),
 }
 
-impl From<Meter> for f32 {
-    fn from(value: Meter) -> Self {
-        match value {
-            Meter::Flow { flow_rate, .. } => flow_rate,
-            Meter::Power { power, .. } => power,
-            Meter::Temperature { temperature, .. } => temperature,
+/// Turn a free-form name into something usable in an entity id.
+fn slug(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
         }
     }
+    out.trim_matches('_').to_string()
+}
+
+/// Publish every scalar field of an unrecognised meter or node as a generic
+/// sensor, so newly discovered eSmart features show up in Home Assistant
+/// without a code change. `prefix` is "meter" or "node".
+pub fn generic_stats(prefix: &str, v: &serde_json::Value) -> Vec<(String, Stat, StatValue)> {
+    let Some(id) = v.get("id").and_then(|i| i.as_u64()) else {
+        return vec![];
+    };
+    let label = v
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| format!("{} {}", prefix, id));
+    // Nodes carry their values under "data", meters at top level
+    let fields = match v.get("data").and_then(|d| d.as_object()) {
+        Some(data) => data.clone(),
+        None => v.as_object().cloned().unwrap_or_default(),
+    };
+    let mut stats = vec![];
+    for (key, value) in fields {
+        if key == "id" || key == "name" {
+            continue;
+        }
+        let stat_value = match &value {
+            serde_json::Value::Number(n) => match n.as_f64() {
+                Some(f) => StatValue::Float(f),
+                None => continue,
+            },
+            serde_json::Value::String(s) => StatValue::Text(s.clone()),
+            serde_json::Value::Bool(b) => StatValue::Text(b.to_string()),
+            _ => continue,
+        };
+        let entity_id = format!("{}_{}_{}", prefix, id, slug(&key));
+        stats.push((
+            entity_id,
+            Stat::new(
+                &format!("{} {}", label, key),
+                Unit::None,
+                DeviceClass::None,
+                "mdi:help-circle-outline",
+                &key,
+            ),
+            stat_value,
+        ));
+    }
+    stats
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ValveData {
     onoff: OnOff,
-    power: f32,
+    power: f64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RoomData {
     #[serde(rename = "deviceOnOff")]
     device_on_off: OnOff,
-    power: f32,
-    setpoint: f32,
-    temperature: f32,
+    power: f64,
+    setpoint: f64,
+    temperature: f64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ActuatorData {
-    position: f32,
-    orientation: f32,
-    power: f32,
+    position: f64,
+    orientation: f64,
+    power: f64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FanData {
     speed: String,
-    power: f32,
+    power: f64,
     mode: String,
 }
 
@@ -213,11 +261,11 @@ pub struct ESmartMessage {
 }
 
 impl ESmartMessage {
-    pub fn iter_meters(&self) -> std::slice::Iter<Meter> {
+    pub fn iter_meters(&self) -> std::slice::Iter<'_, Meter> {
         self.body.meters.iter()
     }
 
-    pub fn iter_nodes(&self) -> std::slice::Iter<Node> {
+    pub fn iter_nodes(&self) -> std::slice::Iter<'_, Node> {
         self.body.nodes.iter()
     }
 
@@ -341,7 +389,7 @@ impl IterStats<std::vec::IntoIter<(String, Stat, StatValue)>> for &Meter {
                 Stat::new(
                     name,
                     Unit::Lmin,
-                    DeviceClass::Water,
+                    DeviceClass::VolumeFlowRate,
                     "mdi:pipe",
                     "flow_rate",
                 ),
@@ -371,6 +419,10 @@ impl IterStats<std::vec::IntoIter<(String, Stat, StatValue)>> for &Meter {
                 ),
                 StatValue::Float(*temperature),
             )],
+            Meter::Unknown(v) => {
+                log::debug!("Unknown meter type: {:?}", v);
+                generic_stats("meter", v)
+            }
         }
         .into_iter()
     }
@@ -468,7 +520,7 @@ impl IterStats<std::vec::IntoIter<(String, Stat, StatValue)>> for &Node {
                 data: ActuatorData { position, orientation, power },
             } => {
                 // eSmart uses 0-1024: 0=fully open, 1024=fully closed
-                // HA uses 0-100: 0=closed, 100=open — so we invert and scale
+                // HA uses 0-100: 0=closed, 100=open, so we invert and scale
                 let ha_position = ((1024.0 - position) / 1024.0 * 100.0).round();
                 let ha_orientation = ((1024.0 - orientation) / 1024.0 * 100.0).round();
                 vec![
@@ -548,8 +600,34 @@ impl IterStats<std::vec::IntoIter<(String, Stat, StatValue)>> for &Node {
             .into_iter(),
             Node::Unknown(v) => {
                 log::debug!("Unknown node type: {:?}", v);
-                vec![].into_iter()
+                generic_stats("node", v).into_iter()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_meter_does_not_break_message() {
+        let body = r#"{"headers":{"from":"master","method":"INFO","size":1,"timestamp":"2026-10-25 12:51:28+0000","to":"remotes","type":"data","version":"1.19.0"},
+            "body":{"meters":[{"id":4,"flow_rate":1.5,"name":"Cold water"},{"id":30,"volume":12.5,"name":"New meter"}],
+            "nodes":[{"id":337,"data":{"speed":"33%","power":0,"mode":"manual"}},{"id":400,"data":{"foo":1}}]}}"#;
+        let msg: ESmartMessage = serde_json::from_str(body).unwrap();
+        let meter_ids: Vec<String> = msg.iter_meters().flat_map(|m| m.into_stats_iter()).map(|s| s.0).collect();
+        assert_eq!(meter_ids, vec!["flow_4", "meter_30_volume"]);
+        let node_ids: Vec<String> = msg.iter_nodes().flat_map(|n| n.into_stats_iter()).map(|s| s.0).collect();
+        assert!(node_ids.contains(&"fan_speed_337".to_string()));
+        assert!(node_ids.contains(&"node_400_foo".to_string()));
+    }
+
+    #[test]
+    fn flow_uses_volume_flow_rate_class() {
+        let m = Meter::Flow { id: 3, name: "Hot Water".into(), flow_rate: 2.0 };
+        let (_, stat, _) = (&m).into_stats_iter().next().unwrap();
+        assert_eq!(stat.device_class_str(), Some("volume_flow_rate"));
+        assert_eq!(stat.unit_str(), Some("L/min"));
     }
 }
